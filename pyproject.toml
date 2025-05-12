@@ -6,12 +6,9 @@ build-backend = "setuptools.build_meta"
 profile = "black"
 
 [project]
-name = "pyfoobar"
-authors = [
-    { name = "Nico Schlömer", email = "nico.schloemer@gmail.com" },
-    { name = "Nicolas Vetsch", email = "vetschnicolas@gmail.com" },
-]
-description = "Best practices for Python projects"
+name = "qtlm"
+authors = [{ name = "Nicolas Vetsch", email = "vetschn@iis.ee.ethz.ch" }]
+description = "Quantum transport through 2D layered materials"
 license = { file = "LICENSE" }
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -19,23 +16,29 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.7",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Topic :: Utilities",
 ]
 dynamic = ["version"]
-requires-python = ">=3.7"
-dependencies = ["numpy"]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "mpi4py",
+    "scipy",
+    "threadpoolctl",
+    "typer",
+    "pydantic",
+]
+
+[project.optional-dependencies]
+gpu = ["cupy"]
+
 
 [project.urls]
-Code = "https://github.com/vetschn/pyfoobar"
+Code = "https://github.com/vetschn/qtlm"
 
 [tool.setuptools.dynamic]
-version = { attr = "pyfoobar.__about__.__version__" }
+version = { attr = "qtlm.__about__.__version__" }
 
 [project.scripts]
-pyfoobar = "pyfoobar.cli:show"
+qtlm = "qtlm.cli:run"

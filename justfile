@@ -1,30 +1,14 @@
-version := `python3 -c "from src.pyfoobar.__about__ import __version__; print(__version__)"`
-
-
-default:
-	@echo "\"just publish\"?"
-
-tag:
-	@if [ "$(git rev-parse --abbrev-ref HEAD)" != "main" ]; then exit 1; fi
-	curl -H "Authorization: token `cat ~/.github-access-token`" -d '{"tag_name": "v{{version}}"}' https://api.github.com/repos/vetschn/pyfoobar/releases
-
-upload: clean
-	@if [ "$(git rev-parse --abbrev-ref HEAD)" != "main" ]; then exit 1; fi
-	# https://stackoverflow.com/a/58756491/353337
-	python3 -m build --sdist --wheel .
-	twine upload dist/*
-
-publish: tag upload
-
+# Cleans the repo.
 clean:
-	@find . | grep -E "(__pycache__|\.pyc|\.pyo$)" | xargs rm -rf
-	@rm -rf src/*.egg-info/ build/ dist/ .tox/
+	@find . | grep -E "(__pycache__|\.pyc|\.pyo|build|generated$)" | xargs rm -rf
+	@rm -rf src/*.egg-info/ build/ dist/ .coverage .pytest_cache/
 
+# Applies formatting to all files.
 format:
-	isort .
+	isort --profile black .
 	black .
 	blacken-docs
 
+# Lints all files.
 lint:
-	black --check .
-	flake8 .
+	ruff check
