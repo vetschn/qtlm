@@ -8,14 +8,7 @@ from typing_extensions import Annotated
 
 import qtlm
 
-HEADER = rf"""
-                                       _/
-       __ `/   /   /   __ `/   ___/    /
-      /   /   /   /   /   /  \__ \    /
-    \__, /  \__,_/  \__,_/  _____/  _/
-       _/
-                           version {qtlm.__version__}
-"""
+HEADER = rf"""qtlm version {qtlm.__version__}"""
 
 
 def secho_header():
@@ -32,7 +25,7 @@ qtlm_cli = typer.Typer(
 
 
 @qtlm_cli.command(no_args_is_help=True)
-def ballistic(
+def transport(
     config: Annotated[
         Path,
         typer.Argument(
@@ -44,33 +37,12 @@ def ballistic(
         ),
     ],
 ):
-    """Computes ballistic electron density."""
+    """Computes transport through the structure."""
     secho_header()
 
-    from qtlm.cli import ballistic
+    from qtlm.cli import transport
 
-    ballistic.main(config)
-
-
-@qtlm_cli.command(no_args_is_help=True)
-def scba(
-    config: Annotated[
-        Path,
-        typer.Argument(
-            exists=True,
-            dir_okay=False,
-            readable=True,
-            resolve_path=True,
-            help="Path to TOML config file.",
-        ),
-    ],
-):
-    """Computes SCBA iterations."""
-    secho_header()
-
-    from qtlm.cli import scba
-
-    scba.main(config)
+    transport.main(config)
 
 
 def version_callback(value: bool):
@@ -92,7 +64,7 @@ def main(
         ),
     ] = None,
 ):
-    """*Tools for NEGF **qua**ntum transport **si**mulations.*"""
+    """Quantum transport through layered materials."""
     pass
 
 

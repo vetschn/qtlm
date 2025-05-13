@@ -28,6 +28,7 @@ dependencies = [
     "threadpoolctl",
     "typer",
     "pydantic",
+    "ase"
 ]
 
 [project.optional-dependencies]
