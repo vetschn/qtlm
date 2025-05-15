@@ -9,15 +9,16 @@ from qtlm.io import read_gpaw_hamiltonian
 from qtlm.statistics import bose_einstein, fermi_dirac
 
 
-def _linear_potential_drop(delta_v: float, pos_min: float, pos_max: float) -> callable:
+def _linear_potential(v_at_pos_max: float, pos_min: float, pos_max: float) -> callable:
     """Creates a linear potential drop between two planes.
 
-    The potential is zero at pos_min and delta_v at pos_max.
+    The potential is zero at pos_min and v_at_pos_max at pos_max. The
+    potential is linear between these two points.
 
     Parameters
     ----------
-    delta_v : float
-        The potential difference between the two planes.
+    v_at_pos_max : float
+        The potential at the maximum position.
     pos_min : float
         The minimum position.
     pos_max : float
@@ -34,8 +35,8 @@ def _linear_potential_drop(delta_v: float, pos_min: float, pos_max: float) -> ca
         """Calculates the potential at a given position."""
         pos = xp.where(pos < pos_min, pos_min, pos)
         pos = xp.where(pos > pos_max, pos_max, pos)
-
-        return delta_v * (pos - pos_min) / (pos_max - pos_min)
+        pot = v_at_pos_max * (pos - pos_min) / (pos_max - pos_min)
+        return pot
 
     return potential
 
@@ -79,6 +80,7 @@ class TransportData:
             "energies": self.energies,
             "transmission": transmission,
             "current": current,
+            "potentials": self.solver.potentials,
         }
 
         for key, value in outputs.items():
@@ -107,6 +109,20 @@ class TransportSolver:
 
         self.H_kMM, self.S_kMM = read_gpaw_hamiltonian(config.input_dir)
         self.num_kpoints = self.H_kMM.shape[0]
+
+        kpoint_weights = None
+        if comm.rank == 0:
+            # Check if the weights file exists.
+            weights_filename = config.input_dir / "weights.npy"
+            if not weights_filename.exists():
+                kpoint_weights = xp.ones(self.num_kpoints)
+                xp.save(weights_filename, kpoint_weights)
+            else:
+                # Load the weights from the file.
+                kpoint_weights = xp.load(weights_filename)
+
+        # Broadcast the weights to all ranks.
+        self.kpoint_weights = comm.bcast(kpoint_weights, root=0)
 
         self._init_device_geometry()
         self._init_contacts()
@@ -218,21 +234,18 @@ class TransportSolver:
                 - sigma_phonon_c[:, None]
             )
 
-            sigma_phonon_l = (
-                self.deformation_potential**2
-                * self.phonon_occupancy
-                * g_l.sum(axis=1)
+            prefactor = self.deformation_potential**2 * self.phonon_occupancy
+
+            sigma_phonon_l = prefactor * np.average(
+                g_l, axis=1, weights=self.kpoint_weights
             )
-            sigma_phonon_r = (
-                self.deformation_potential**2
-                * self.phonon_occupancy
-                * g_r.sum(axis=1)
+            sigma_phonon_r = prefactor * np.average(
+                g_r, axis=1, weights=self.kpoint_weights
             )
-            sigma_phonon_c = (
-                self.deformation_potential**2
-                * self.phonon_occupancy
-                * g_c.sum(axis=1)
+            sigma_phonon_c = prefactor * np.average(
+                g_c, axis=1, weights=self.kpoint_weights
             )
+
             update = xp.max(xp.abs(sigma_phonon_c - sigma_phonon_c_previous))
             if comm.rank == 0:
                 print(f"SCBA Iteration {i}: {update:.2e}", flush=True)
@@ -311,7 +324,7 @@ class TransportSolver:
     def _construct_potential(self, bias_point):
         """Constructs the potential for the given bias point."""
 
-        potential_drop = _linear_potential_drop(
+        potential_drop = _linear_potential(
             bias_point,
             self.orbital_positions[:, self.transport_axis].min(),
             self.orbital_positions[:, self.transport_axis].max(),
@@ -328,15 +341,13 @@ class TransportSolver:
                 self.energies.size // min(self.energy_batch_size, self.energies.size),
             )
         ]
-
+        potentials = []
         for i, bias_point in enumerate(self.bias_points):
             if comm.rank == 0:
                 print(f"Bias point: {bias_point:.2f} V", flush=True)
             t_start = time.perf_counter()
             self._construct_potential(bias_point)
-
-            # for j, __ in enumerate(self.energies):
-            #     self._compute_transmission(bias_ind=i, energy_ind=j)
+            potentials.append(self.potential)
 
             for energy_slice in energy_slices:
                 self._compute_transmission(bias_ind=i, energy_slice=energy_slice)
@@ -347,6 +358,7 @@ class TransportSolver:
                     f"Bias point {i + 1}/{self.bias_points.size} completed in {t_end - t_start:.2f} s",
                     flush=True,
                 )
+        self.potentials = xp.array(potentials)
 
     def compute_current(self):
         """Computes the current for the given bias points."""
@@ -363,11 +375,14 @@ class TransportSolver:
             integrand = (
                 transmission[i]
                 * (
-                    fermi_dirac(self.data.energies - mu_r)
-                    - fermi_dirac(self.data.energies - mu_l)
+                    fermi_dirac(self.data.energies - mu_l)
+                    - fermi_dirac(self.data.energies - mu_r)
                 )[:, None]
             )
 
-            current[i] = xp.sum(xp.trapz(integrand, self.data.energies, axis=0))
+            current[i] = xp.average(
+                xp.trapz(integrand, self.data.energies, axis=0),
+                weights=self.kpoint_weights,
+            )
 
         return transmission, current
