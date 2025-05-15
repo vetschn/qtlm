@@ -1,8 +1,11 @@
 from pathlib import Path
 
 from mpi4py.MPI import COMM_WORLD as comm
+from mpi4py.util import pkl5
 
 from qtlm import NDArray, xp
+
+comm = pkl5.Intracomm(comm)
 
 
 def read_gpaw_hamiltonian(directory: str | Path) -> NDArray:
