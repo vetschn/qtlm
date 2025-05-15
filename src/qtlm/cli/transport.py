@@ -16,7 +16,6 @@ def main(config_file: Path):
         The configuration for the transport calculation.
 
     """
-    print(comm.size, flush=True)
     config = parse_config(config_file)
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -25,7 +24,7 @@ def main(config_file: Path):
 
     solver = TransportSolver(config)
 
-    with threadpool_limits(limits=1, user_api="blas"):
+    with threadpool_limits(limits=2, user_api="blas"):
         solver.solve()
 
     solver.data.write()

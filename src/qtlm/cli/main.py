@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Optional
 
 import typer
+from mpi4py.MPI import COMM_WORLD as comm
 from typing_extensions import Annotated
 
 import qtlm
@@ -13,7 +14,8 @@ HEADER = rf"""qtlm version {qtlm.__version__}"""
 
 def secho_header():
     """Prints the header to the console."""
-    typer.secho(HEADER, fg="bright_white", bold=True)
+    if comm.rank == 0:
+        typer.secho(HEADER, fg="bright_white", bold=True)
 
 
 # Instantiate the CLI app.
