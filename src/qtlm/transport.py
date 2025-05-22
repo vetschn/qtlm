@@ -9,6 +9,21 @@ from qtlm.io import read_gpaw_hamiltonian
 from qtlm.statistics import bose_einstein, fermi_dirac
 
 
+def invert(a: NDArray) -> NDArray:
+    return xp.linalg.inv(a)
+
+
+if xp.__name__ == "cupy":
+    name = xp.cuda.runtime.getDeviceProperties(0)["name"].decode("utf-8")
+    if name.startswith("NVIDIA"):
+        from cupy.cublas import set_batched_gesv_limit
+
+        set_batched_gesv_limit(1024)
+
+        def invert(a: NDArray) -> NDArray:
+            return xp.linalg.solve(a, xp.broadcast_to(xp.eye(a.shape[-1]), a.shape))
+
+
 def _linear_potential(v_at_pos_max: float, pos_min: float, pos_max: float) -> callable:
     """Creates a linear potential drop between two planes.
 
@@ -172,13 +187,49 @@ class TransportSolver:
         )
         self.inds_c = xp.setdiff1d(self.inds_c, self.inds_r)
 
-        self.inds_ll = xp.ix_(self.inds_l, self.inds_l)
-        self.inds_rr = xp.ix_(self.inds_r, self.inds_r)
-        self.inds_cl = xp.ix_(self.inds_c, self.inds_l)
-        self.inds_cr = xp.ix_(self.inds_c, self.inds_r)
-        self.inds_lc = xp.ix_(self.inds_l, self.inds_c)
-        self.inds_rc = xp.ix_(self.inds_r, self.inds_c)
-        self.inds_cc = xp.ix_(self.inds_c, self.inds_c)
+        if self.inds_l.size == 0 or self.inds_r.size == 0:
+            raise ValueError(
+                "No contact regions found. Please check the contact region definitions."
+            )
+
+        # Check if the indices can be slices instead. This can prevent
+        # fancy indexing and improve memory efficiency.
+        inds_are_slices = (
+            xp.array_equal(
+                self.inds_l,
+                xp.arange(int(self.inds_l.min()), int(self.inds_l.max()) + 1),
+            )
+            and xp.array_equal(
+                self.inds_r,
+                xp.arange(int(self.inds_r.min()), int(self.inds_r.max()) + 1),
+            )
+            and xp.array_equal(
+                self.inds_c,
+                xp.arange(int(self.inds_c.min()), int(self.inds_c.max()) + 1),
+            )
+        )
+        if inds_are_slices:
+            slice_l = slice(int(self.inds_l.min()), int(self.inds_l.max()) + 1)
+            slice_r = slice(int(self.inds_r.min()), int(self.inds_r.max()) + 1)
+            slice_c = slice(int(self.inds_c.min()), int(self.inds_c.max()) + 1)
+
+            self.inds_ll = (slice_l, slice_l)
+            self.inds_rr = (slice_r, slice_r)
+            self.inds_cl = (slice_c, slice_l)
+            self.inds_cr = (slice_c, slice_r)
+            self.inds_lc = (slice_l, slice_c)
+            self.inds_rc = (slice_r, slice_c)
+            self.inds_cc = (slice_c, slice_c)
+
+        else:
+
+            self.inds_ll = xp.ix_(self.inds_l, self.inds_l)
+            self.inds_rr = xp.ix_(self.inds_r, self.inds_r)
+            self.inds_cl = xp.ix_(self.inds_c, self.inds_l)
+            self.inds_cr = xp.ix_(self.inds_c, self.inds_r)
+            self.inds_lc = xp.ix_(self.inds_l, self.inds_c)
+            self.inds_rc = xp.ix_(self.inds_r, self.inds_c)
+            self.inds_cc = xp.ix_(self.inds_c, self.inds_c)
 
     def _init_phonons(self):
         """Initializes the phonon parameters."""
@@ -206,10 +257,10 @@ class TransportSolver:
         for i in range(self.config.scba.max_iterations):
             # TODO: Think about where to apply the phonon self-energy.
 
-            g_l = xp.linalg.inv(
+            g_l = invert(
                 contact_system_matrix[..., *self.inds_ll] - sigma_phonon_l[:, None]
             )
-            g_r = xp.linalg.inv(
+            g_r = invert(
                 contact_system_matrix[..., *self.inds_rr] - sigma_phonon_r[:, None]
             )
 
@@ -227,7 +278,7 @@ class TransportSolver:
             gamma_l = 1j * (sigma_l - sigma_l.conj().swapaxes(-1, -2))
             gamma_r = 1j * (sigma_r - sigma_r.conj().swapaxes(-1, -2))
 
-            g_c = xp.linalg.inv(
+            g_c = invert(
                 system_matrix[..., *self.inds_cc]
                 - sigma_l
                 - sigma_r
@@ -236,13 +287,13 @@ class TransportSolver:
 
             prefactor = self.deformation_potential**2 * self.phonon_occupancy
 
-            sigma_phonon_l = prefactor * np.average(
+            sigma_phonon_l = prefactor * xp.average(
                 g_l, axis=1, weights=self.kpoint_weights
             )
-            sigma_phonon_r = prefactor * np.average(
+            sigma_phonon_r = prefactor * xp.average(
                 g_r, axis=1, weights=self.kpoint_weights
             )
-            sigma_phonon_c = prefactor * np.average(
+            sigma_phonon_c = prefactor * xp.average(
                 g_c, axis=1, weights=self.kpoint_weights
             )
 
@@ -251,7 +302,10 @@ class TransportSolver:
                 print(f"SCBA Iteration {i}: {update:.2e}", flush=True)
             sigma_phonon_c_previous = sigma_phonon_c.copy()
 
-            if update < self.config.scba.convergence_tol:
+            if (
+                update < self.config.scba.convergence_tol
+                and i > self.config.scba.min_iterations
+            ):
                 if comm.rank == 0:
                     print("SCBA converged.", flush=True)
                 break
@@ -271,24 +325,28 @@ class TransportSolver:
             The bias point at which to compute the transmission.
 
         """
+        # Construct the potential
+        potential = self.potential.reshape(1, -1)
+        potential = 0.5 * (self.S_kMM * potential + self.S_kMM * potential.T)
+
         contact_system_matrix = (
-            np.einsum(
+            xp.einsum(
                 "i,jkl -> ijkl",
                 (self.energies[energy_slice] + 1j * self.config.electron.eta_contact),
                 self.S_kMM,
             )
             - self.H_kMM
-            - xp.diag(self.potential)
+            - potential
         )
 
         system_matrix = (
-            np.einsum(
+            xp.einsum(
                 "i,jkl -> ijkl",
                 (self.energies[energy_slice] + 1j * self.config.electron.eta),
                 self.S_kMM,
             )
             - self.H_kMM
-            - xp.diag(self.potential)
+            - potential
         )
 
         if self.config.scba.phonon:
@@ -296,8 +354,8 @@ class TransportSolver:
                 contact_system_matrix, system_matrix
             )
         else:
-            g_l = xp.linalg.inv(contact_system_matrix[..., *self.inds_ll])
-            g_r = xp.linalg.inv(contact_system_matrix[..., *self.inds_rr])
+            g_l = invert(contact_system_matrix[..., *self.inds_ll])
+            g_r = invert(contact_system_matrix[..., *self.inds_rr])
 
             sigma_l = (
                 system_matrix[..., *self.inds_cl]
@@ -313,7 +371,7 @@ class TransportSolver:
             gamma_l = 1j * (sigma_l - sigma_l.conj().swapaxes(-1, -2))
             gamma_r = 1j * (sigma_r - sigma_r.conj().swapaxes(-1, -2))
 
-            g_c = xp.linalg.inv(system_matrix[..., *self.inds_cc] - sigma_l - sigma_r)
+            g_c = invert(system_matrix[..., *self.inds_cc] - sigma_l - sigma_r)
 
         self.data.transmission[bias_ind, energy_slice, ...] = xp.trace(
             gamma_l @ g_c @ gamma_r @ g_c.conj().swapaxes(-1, -2),
