@@ -1,4 +1,5 @@
-from qtlm import NDArray, xp
+from qtlm import NDArray
+import numpy as np
 from qtlm.constants import k_B
 
 
@@ -18,7 +19,7 @@ def fermi_dirac(energy: float | NDArray, temperature: float = 300) -> float:
         Fermi-Dirac occupancy.
 
     """
-    return 1.0 / (1.0 + xp.exp(energy / (k_B * temperature)))
+    return 1.0 / (1.0 + np.exp(energy / (k_B * temperature)))
 
 
 def bose_einstein(energy: float | NDArray, temperature: float = 300) -> float:
@@ -37,4 +38,4 @@ def bose_einstein(energy: float | NDArray, temperature: float = 300) -> float:
         Bose-Einstein occupancy.
 
     """
-    return 1.0 / (xp.exp(energy / (k_B * temperature)) - 1.0)
+    return 1.0 / (np.exp(energy / (k_B * temperature)) - 1.0)
