@@ -121,7 +121,7 @@ class TransportSolver:
         self.transport_axis = "xyz".index(self.config.device.transport_direction)
 
         self.h_r, self.s_r, self.r = read_tight_binding_data(config.input_dir)
-        self.kpts: NDArray = xp.array(kpoints.monkhorst_pack(config.electron.kpts_size))
+        self.kpts: NDArray = xp.array(kpoints.monkhorst_pack(config.electron.kpt_grid))
         self.kpt_batch_size = config.electron.kpt_batch_size
 
         self._init_device_geometry()
@@ -153,6 +153,18 @@ class TransportSolver:
 
         repeats = np.vectorize(self.config.device.num_orbitals_per_atom.get)(atom_types)
         self.orbital_positions = np.repeat(atom_positions, repeats, axis=0)
+        
+        # Check that the hamiltonian and overlap matrices have the correct shape.
+        if self.h_r.shape[-1] != self.orbital_positions.shape[0]:
+            raise ValueError(
+                "The Hamiltonian matrix does not match the number of orbitals. "
+                "Please check the input data."
+            )
+        if self.s_r.shape[-1] != self.orbital_positions.shape[0]:
+            raise ValueError(
+                "The overlap matrix does not match the number of orbitals. "
+                "Please check the input data."
+            )
 
     def _init_contacts(self):
         """Initializes the indices for the contact regions."""
@@ -226,18 +238,24 @@ class TransportSolver:
                 return 0, bias_voltage, bias_voltage
 
         elif self.config.device.capacitor_model == "graphene":
+            if comm.rank == 0:
+                print("Using graphene capacitor model.", flush=True)
             capacitor_config = self.config.device.graphene_capacitor
             plate_separation = capacitor_config.plate_separation
             if plate_separation == "auto":
-
                 plate_separation = (
                     self.orbital_positions[self.inds_r][:, self.transport_axis].min()
                     - self.orbital_positions[self.inds_l][:, self.transport_axis].max()
-                )
+                ) * 1e-10  # Convert to meters.
                 assert plate_separation > 0, (
                     "Plate separation must be positive. "
                     "Please check the contact region definitions."
                 )
+                if comm.rank == 0:
+                    print(
+                        f"Automatically determined plate separation: {plate_separation:.2e} m",
+                        flush=True,
+                    )
 
             capacitance = (
                 epsilon_0 * capacitor_config.dielectric_permittivity / plate_separation

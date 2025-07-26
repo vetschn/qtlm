@@ -65,7 +65,7 @@ class ElectronConfig(BaseModel):
     energy_window_num: PositiveInt | None = None
     energy_step: float | None = None
 
-    kpts_size: tuple[PositiveInt, PositiveInt, PositiveInt]
+    kpt_grid: tuple[PositiveInt, PositiveInt, PositiveInt]
 
     energy_batch_size: PositiveInt = 128
     kpt_batch_size: PositiveInt = 4096
@@ -98,7 +98,7 @@ class ElectronConfig(BaseModel):
     @model_validator(mode="after")
     def kpts_size_to_tuple(self) -> Self:
         """Transforms list to tuple."""
-        self.kpts_size = tuple(self.kpts_size)
+        self.kpt_grid = tuple(self.kpt_grid)
         return self
 
 
@@ -127,7 +127,7 @@ class DeviceConfig(BaseModel):
         default_factory=lambda: _default_num_orbitals_per_atom
     )
 
-    capacitor_model = Literal["none", "graphene"] = "none"
+    capacitor_model : Literal["none", "graphene"] = "none"
     graphene_capacitor: GrapheneCapacitorConfig = GrapheneCapacitorConfig()
 
     @model_validator(mode="after")
