@@ -1,34 +1,24 @@
 import time
 
+from ase.dft import kpoints
 import numpy as np
 from mpi4py.MPI import COMM_WORLD as comm
+from mpi4py.util import pkl5
 
-from qtlm import NDArray, xp
+from qtlm import NDArray, xp, linalg
 from qtlm.config import QTLMConfig
-from qtlm.io import read_gpaw_hamiltonian
-from qtlm.statistics import bose_einstein, fermi_dirac
+from qtlm.io import read_tight_binding_data
+from qtlm.gpu import free_mempool
+from qtlm.statistics import fermi_dirac
+from qtlm.capacitor import compute_capacitor_potentials
+from qtlm.constants import epsilon_0
 
 
-def invert(a: NDArray) -> NDArray:
-    return xp.linalg.inv(a)
+comm = pkl5.Intracomm(comm)
 
 
-if xp.__name__ == "cupy":
-    name = xp.cuda.runtime.getDeviceProperties(0)["name"].decode("utf-8")
-    if name.startswith("NVIDIA"):
-        from cupy.cublas import set_batched_gesv_limit
-
-        set_batched_gesv_limit(1024)
-
-        def invert(a: NDArray) -> NDArray:
-            return xp.linalg.solve(a, xp.broadcast_to(xp.eye(a.shape[-1]), a.shape))
-
-
-def _linear_potential(v_at_pos_max: float, pos_min: float, pos_max: float) -> callable:
+def _linear_potential(v_at_pos_min: float, pos_min: float, pos_max: float) -> callable:
     """Creates a linear potential drop between two planes.
-
-    The potential is zero at pos_min and v_at_pos_max at pos_max. The
-    potential is linear between these two points.
 
     Parameters
     ----------
@@ -48,9 +38,10 @@ def _linear_potential(v_at_pos_max: float, pos_min: float, pos_max: float) -> ca
 
     def potential(pos: NDArray) -> NDArray:
         """Calculates the potential at a given position."""
-        pos = xp.where(pos < pos_min, pos_min, pos)
-        pos = xp.where(pos > pos_max, pos_max, pos)
-        pot = v_at_pos_max * (pos - pos_min) / (pos_max - pos_min)
+        pos = np.where(pos < pos_min, pos_min, pos)
+        pos = np.where(pos > pos_max, pos_max, pos)
+        # pot = v_at_pos_max * (pos - pos_min) / (pos_max - pos_min)
+        pot = v_at_pos_min * (pos - pos_max) / (pos_min - pos_max)
         return pot
 
     return potential
@@ -58,6 +49,11 @@ def _linear_potential(v_at_pos_max: float, pos_min: float, pos_max: float) -> ca
 
 class TransportData:
     """Container for transport data.
+
+    Parameters
+    ----------
+    solver : TransportSolver
+        The transport solver instance.
 
     Attributes
     ----------
@@ -70,11 +66,11 @@ class TransportData:
         """Initializes the transport data."""
         self.output_dir = solver.config.output_dir
         self.solver = solver
-        self.transmission = xp.zeros(
+        self.transmission = np.empty(
             (
                 solver.config.bias.num_bias_points,
                 solver.energies.size,
-                solver.num_kpoints,
+                solver.kpts.size,
             )
         )
         self.bias_points = solver.config.bias.bias_points
@@ -118,37 +114,28 @@ class TransportSolver:
         self.config = config
 
         self.bias_points = config.bias.bias_points
-        self.energies = xp.array_split(config.electron.energies, comm.size)[comm.rank]
+        self.energies: NDArray = xp.array_split(config.electron.energies, comm.size)[
+            comm.rank
+        ]
         self.energy_batch_size = config.electron.energy_batch_size
         self.transport_axis = "xyz".index(self.config.device.transport_direction)
 
-        self.H_kMM, self.S_kMM = read_gpaw_hamiltonian(config.input_dir)
-        self.num_kpoints = self.H_kMM.shape[0]
-
-        kpoint_weights = None
-        if comm.rank == 0:
-            # Check if the weights file exists.
-            weights_filename = config.input_dir / "weights.npy"
-            if not weights_filename.exists():
-                kpoint_weights = xp.ones(self.num_kpoints)
-                xp.save(weights_filename, kpoint_weights)
-            else:
-                # Load the weights from the file.
-                kpoint_weights = xp.load(weights_filename)
-
-        # Broadcast the weights to all ranks.
-        self.kpoint_weights = comm.bcast(kpoint_weights, root=0)
+        self.h_r, self.s_r, self.r = read_tight_binding_data(config.input_dir)
+        self.kpts: NDArray = xp.array(kpoints.monkhorst_pack(config.electron.kpts_size))
+        self.kpt_batch_size = config.electron.kpt_batch_size
 
         self._init_device_geometry()
         self._init_contacts()
-        self._init_phonons()
+        self._init_capacitor_model()
 
         self.data = TransportData(self)
 
         if comm.rank == 0:
-            print(f"Number of k-points: {self.num_kpoints}", flush=True)
+            print(f"Number of k-points: {self.kpts}", flush=True)
             print(f"Number of orbitals: {self.orbital_positions.shape[0]}", flush=True)
             print(f"Number of energy points: {self.energies.shape[0]}", flush=True)
+
+        free_mempool()
 
     def _init_device_geometry(self):
         """Initializes the device geometry."""
@@ -166,26 +153,25 @@ class TransportSolver:
 
         repeats = np.vectorize(self.config.device.num_orbitals_per_atom.get)(atom_types)
         self.orbital_positions = np.repeat(atom_positions, repeats, axis=0)
-        self.orbital_positions = xp.array(self.orbital_positions)
 
     def _init_contacts(self):
         """Initializes the indices for the contact regions."""
         start_l, stop_l = self.config.device.left_contact_region
         start_r, stop_r = self.config.device.right_contact_region
 
-        self.inds_l = xp.where(
+        self.inds_l = np.where(
             (self.orbital_positions[:, self.transport_axis] >= start_l)
             & (self.orbital_positions[:, self.transport_axis] <= stop_l)
         )[0]
-        self.inds_r = xp.where(
+        self.inds_r = np.where(
             (self.orbital_positions[:, self.transport_axis] >= start_r)
             & (self.orbital_positions[:, self.transport_axis] <= stop_r)
         )[0]
         # Central inds correspond to all the remaining orbitals.
-        self.inds_c = xp.setdiff1d(
-            xp.arange(self.orbital_positions.shape[0]), self.inds_l
+        self.inds_c = np.setdiff1d(
+            np.arange(self.orbital_positions.shape[0]), self.inds_l
         )
-        self.inds_c = xp.setdiff1d(self.inds_c, self.inds_r)
+        self.inds_c = np.setdiff1d(self.inds_c, self.inds_r)
 
         if self.inds_l.size == 0 or self.inds_r.size == 0:
             raise ValueError(
@@ -195,23 +181,23 @@ class TransportSolver:
         # Check if the indices can be slices instead. This can prevent
         # fancy indexing and improve memory efficiency.
         inds_are_slices = (
-            xp.array_equal(
+            np.array_equal(
                 self.inds_l,
-                xp.arange(int(self.inds_l.min()), int(self.inds_l.max()) + 1),
+                np.arange(self.inds_l.min(), self.inds_l.max() + 1),
             )
-            and xp.array_equal(
+            and np.array_equal(
                 self.inds_r,
-                xp.arange(int(self.inds_r.min()), int(self.inds_r.max()) + 1),
+                np.arange(self.inds_r.min(), self.inds_r.max() + 1),
             )
-            and xp.array_equal(
+            and np.array_equal(
                 self.inds_c,
-                xp.arange(int(self.inds_c.min()), int(self.inds_c.max()) + 1),
+                np.arange(self.inds_c.min(), self.inds_c.max() + 1),
             )
         )
         if inds_are_slices:
-            slice_l = slice(int(self.inds_l.min()), int(self.inds_l.max()) + 1)
-            slice_r = slice(int(self.inds_r.min()), int(self.inds_r.max()) + 1)
-            slice_c = slice(int(self.inds_c.min()), int(self.inds_c.max()) + 1)
+            slice_l = slice(self.inds_l.min(), self.inds_l.max() + 1)
+            slice_r = slice(self.inds_r.min(), self.inds_r.max() + 1)
+            slice_c = slice(self.inds_c.min(), self.inds_c.max() + 1)
 
             self.inds_ll = (slice_l, slice_l)
             self.inds_rr = (slice_r, slice_r)
@@ -223,157 +209,126 @@ class TransportSolver:
 
         else:
 
-            self.inds_ll = xp.ix_(self.inds_l, self.inds_l)
-            self.inds_rr = xp.ix_(self.inds_r, self.inds_r)
-            self.inds_cl = xp.ix_(self.inds_c, self.inds_l)
-            self.inds_cr = xp.ix_(self.inds_c, self.inds_r)
-            self.inds_lc = xp.ix_(self.inds_l, self.inds_c)
-            self.inds_rc = xp.ix_(self.inds_r, self.inds_c)
-            self.inds_cc = xp.ix_(self.inds_c, self.inds_c)
+            self.inds_ll = np.ix_(self.inds_l, self.inds_l)
+            self.inds_rr = np.ix_(self.inds_r, self.inds_r)
+            self.inds_cl = np.ix_(self.inds_c, self.inds_l)
+            self.inds_cr = np.ix_(self.inds_c, self.inds_r)
+            self.inds_lc = np.ix_(self.inds_l, self.inds_c)
+            self.inds_rc = np.ix_(self.inds_r, self.inds_c)
+            self.inds_cc = np.ix_(self.inds_c, self.inds_c)
 
-    def _init_phonons(self):
-        """Initializes the phonon parameters."""
-        self.phonon_occupancy = bose_einstein(
-            self.config.phonon.energy, temperature=self.config.phonon.temperature
-        )
-        self.deformation_potential = self.config.phonon.deformation_potential
+    def _init_capacitor_model(self):
+        """Initializes the capacitor model."""
+        if self.config.device.capacitor_model == "none":
 
-    def _converge_scba(
-        self, contact_system_matrix: NDArray, system_matrix: NDArray
-    ) -> tuple:
-        """Converges the SCBA equations."""
-        sigma_phonon_l = xp.zeros_like(
-            system_matrix[:, 0, *self.inds_ll], dtype=complex
-        )
-        sigma_phonon_r = xp.zeros_like(
-            system_matrix[:, 0, *self.inds_rr], dtype=complex
-        )
-        sigma_phonon_c = xp.zeros_like(
-            system_matrix[:, 0, *self.inds_cc], dtype=complex
-        )
+            def _compute_potentials(bias_voltage: float) -> NDArray:
+                """Returns a zero potential for the capacitor model."""
+                return 0, bias_voltage, bias_voltage
 
-        sigma_phonon_c_previous = xp.zeros_like(sigma_phonon_c)
+        elif self.config.device.capacitor_model == "graphene":
+            capacitor_config = self.config.device.graphene_capacitor
+            plate_separation = capacitor_config.plate_separation
+            if plate_separation == "auto":
 
-        for i in range(self.config.scba.max_iterations):
-            # TODO: Think about where to apply the phonon self-energy.
+                plate_separation = (
+                    self.orbital_positions[self.inds_r][:, self.transport_axis].min()
+                    - self.orbital_positions[self.inds_l][:, self.transport_axis].max()
+                )
+                assert plate_separation > 0, (
+                    "Plate separation must be positive. "
+                    "Please check the contact region definitions."
+                )
 
-            g_l = invert(
-                contact_system_matrix[..., *self.inds_ll] - sigma_phonon_l[:, None]
-            )
-            g_r = invert(
-                contact_system_matrix[..., *self.inds_rr] - sigma_phonon_r[:, None]
-            )
+            capacitance = (
+                epsilon_0 * capacitor_config.dielectric_permittivity / plate_separation
+            )  # F/m^2
 
-            sigma_l = (
-                system_matrix[..., *self.inds_cl]
-                @ g_l
-                @ system_matrix[..., *self.inds_lc]
-            )
-            sigma_r = (
-                system_matrix[..., *self.inds_cr]
-                @ g_r
-                @ system_matrix[..., *self.inds_rc]
-            )
+            def _compute_potentials(bias_voltage: float) -> NDArray:
+                """Computes the potentials for the graphene capacitor model."""
+                return compute_capacitor_potentials(
+                    bias_voltage=bias_voltage,
+                    capacitance=capacitance,
+                    fermi_velocity=capacitor_config.fermi_velocity,
+                )
 
-            gamma_l = 1j * (sigma_l - sigma_l.conj().swapaxes(-1, -2))
-            gamma_r = 1j * (sigma_r - sigma_r.conj().swapaxes(-1, -2))
+        self.compute_potentials = _compute_potentials
 
-            g_c = invert(
-                system_matrix[..., *self.inds_cc]
-                - sigma_l
-                - sigma_r
-                - sigma_phonon_c[:, None]
-            )
-
-            prefactor = self.deformation_potential**2 * self.phonon_occupancy
-
-            sigma_phonon_l = prefactor * xp.average(
-                g_l, axis=1, weights=self.kpoint_weights
-            )
-            sigma_phonon_r = prefactor * xp.average(
-                g_r, axis=1, weights=self.kpoint_weights
-            )
-            sigma_phonon_c = prefactor * xp.average(
-                g_c, axis=1, weights=self.kpoint_weights
-            )
-
-            update = xp.max(xp.abs(sigma_phonon_c - sigma_phonon_c_previous))
-            if comm.rank == 0:
-                print(f"SCBA Iteration {i}: {update:.2e}", flush=True)
-            sigma_phonon_c_previous = sigma_phonon_c.copy()
-
-            if (
-                update < self.config.scba.convergence_tol
-                and i > self.config.scba.min_iterations
-            ):
-                if comm.rank == 0:
-                    print("SCBA converged.", flush=True)
-                break
-
-        else:  # Maximum number of iterations reached.
-            if comm.rank == 0:
-                print("Maximum number of iterations reached.", flush=True)
-
-        return gamma_l, g_c, gamma_r
-
-    def _compute_transmission(self, bias_ind: int, energy_slice: slice) -> NDArray:
+    def _compute_transmission(
+        self, bias_ind: int, energy_slice: slice, kpt_slice: slice
+    ) -> NDArray:
         """Computes the transmission for a given bias point.
 
         Parameters
         ----------
         bias_point : float
             The bias point at which to compute the transmission.
+        energy_slice : slice
+            The slice of the energy array to use.
+        kpt_slice : slice
+            The slice of the k-point array to use.
 
         """
-        # Construct the potential
+
+        # Assemble Hamiltonian and overlap matrices for the given kpts.
+        phases = xp.einsum("ik,jk->ij", self.kpts[kpt_slice], self.r, optimize=True)
+        phase_factors = np.exp(2j * np.pi * phases)
+        h_k = xp.einsum("ij,jkl->ikl", phase_factors, self.h_r, optimize=True)
+        s_k = xp.einsum("ij,jkl->ikl", phase_factors, self.s_r, optimize=True)
+
+        # Construct the potential.
         potential = self.potential.reshape(1, -1)
-        potential = 0.5 * (self.S_kMM * potential + self.S_kMM * potential.T)
+        potential = 0.5 * (s_k * potential + s_k * potential.T)
 
-        contact_system_matrix = (
+        # Open boundary conditions.
+        system_matrix_l = (
             xp.einsum(
-                "i,jkl -> ijkl",
+                "i,jkl->ijkl",
                 (self.energies[energy_slice] + 1j * self.config.electron.eta_contact),
-                self.S_kMM,
+                s_k[..., *self.inds_ll],
+                optimize=True,
             )
-            - self.H_kMM
-            - potential
+            - h_k[..., *self.inds_ll]
+            - potential[..., *self.inds_ll]
         )
+        g_l = linalg.inv(system_matrix_l)
 
+        system_matrix_r = (
+            xp.einsum(
+                "i,jkl->ijkl",
+                (self.energies[energy_slice] + 1j * self.config.electron.eta_contact),
+                s_k[..., *self.inds_rr],
+                optimize=True,
+            )
+            - h_k[..., *self.inds_rr]
+            - potential[..., *self.inds_rr]
+        )
+        g_r = linalg.inv(system_matrix_r)
+
+        # Central region.
         system_matrix = (
             xp.einsum(
-                "i,jkl -> ijkl",
+                "i,jkl->ijkl",
                 (self.energies[energy_slice] + 1j * self.config.electron.eta),
-                self.S_kMM,
+                s_k,
             )
-            - self.H_kMM
+            - h_k
             - potential
         )
 
-        if self.config.scba.phonon:
-            gamma_l, g_c, gamma_r = self._converge_scba(
-                contact_system_matrix, system_matrix
-            )
-        else:
-            g_l = invert(contact_system_matrix[..., *self.inds_ll])
-            g_r = invert(contact_system_matrix[..., *self.inds_rr])
+        sigma_l: NDArray = (
+            system_matrix[..., *self.inds_cl] @ g_l @ system_matrix[..., *self.inds_lc]
+        )
+        sigma_r: NDArray = (
+            system_matrix[..., *self.inds_cr] @ g_r @ system_matrix[..., *self.inds_rc]
+        )
 
-            sigma_l = (
-                system_matrix[..., *self.inds_cl]
-                @ g_l
-                @ system_matrix[..., *self.inds_lc]
-            )
-            sigma_r = (
-                system_matrix[..., *self.inds_cr]
-                @ g_r
-                @ system_matrix[..., *self.inds_rc]
-            )
+        g_c = linalg.inv(system_matrix[..., *self.inds_cc] - sigma_l - sigma_r)
 
-            gamma_l = 1j * (sigma_l - sigma_l.conj().swapaxes(-1, -2))
-            gamma_r = 1j * (sigma_r - sigma_r.conj().swapaxes(-1, -2))
+        # Compute the transmission.
+        gamma_l = 1j * (sigma_l - sigma_l.conj().swapaxes(-1, -2))
+        gamma_r = 1j * (sigma_r - sigma_r.conj().swapaxes(-1, -2))
 
-            g_c = invert(system_matrix[..., *self.inds_cc] - sigma_l - sigma_r)
-
-        self.data.transmission[bias_ind, energy_slice, ...] = xp.trace(
+        self.data.transmission[bias_ind, energy_slice, kpt_slice] = np.trace(
             gamma_l @ g_c @ gamma_r @ g_c.conj().swapaxes(-1, -2),
             axis1=-2,
             axis2=-1,
@@ -381,13 +336,18 @@ class TransportSolver:
 
     def _construct_potential(self, bias_point):
         """Constructs the potential for the given bias point."""
-
+        *__, phi = self.compute_potentials(bias_point)
         potential_drop = _linear_potential(
-            bias_point,
-            self.orbital_positions[:, self.transport_axis].min(),
-            self.orbital_positions[:, self.transport_axis].max(),
+            phi,
+            self.orbital_positions[self.inds_l][:, self.transport_axis].max(),
+            self.orbital_positions[self.inds_r][:, self.transport_axis].min(),
         )
-        self.potential = potential_drop(self.orbital_positions[:, self.transport_axis])
+        self.potential = xp.array(
+            potential_drop(self.orbital_positions[:, self.transport_axis])
+        )
+        # Hack to make the TMD potential zero at the right contact.
+        self.potential[self.inds_r] = 0.0
+        self.potential[self.inds_l] = phi
 
     def solve(self):
         """Solves the transport equations for the given bias points."""
@@ -399,6 +359,13 @@ class TransportSolver:
                 self.energies.size // min(self.energy_batch_size, self.energies.size),
             )
         ]
+        kpt_slices = [
+            slice(arr.min(), arr.max() + 1)
+            for arr in np.array_split(
+                np.arange(self.kpts.size),
+                self.kpts.size // min(self.kpt_batch_size, self.kpts.size),
+            )
+        ]
         potentials = []
         for i, bias_point in enumerate(self.bias_points):
             if comm.rank == 0:
@@ -407,15 +374,24 @@ class TransportSolver:
             self._construct_potential(bias_point)
             potentials.append(self.potential)
 
-            for energy_slice in energy_slices:
-                self._compute_transmission(bias_ind=i, energy_slice=energy_slice)
+            for kpt_slice in kpt_slices:
+                if comm.rank == 0:
+                    print(
+                        f"Computing transmission for bias point {i + 1}/{self.bias_points.size}, "
+                        f"k-point slice {kpt_slice.start}:{kpt_slice.stop}",
+                        flush=True,
+                    )
+                for energy_slice in energy_slices:
+                    # Compute the transmission for the given energy and k-point
+                    self._compute_transmission(
+                        bias_ind=i, energy_slice=energy_slice, kpt_slice=kpt_slice
+                    )
 
             t_end = time.perf_counter()
-            if comm.rank == 0:
-                print(
-                    f"Bias point {i + 1}/{self.bias_points.size} completed in {t_end - t_start:.2f} s",
-                    flush=True,
-                )
+            print(
+                f"{comm.rank=}: Bias point {i + 1}/{self.bias_points.size} completed in {t_end - t_start:.2f} s",
+                flush=True,
+            )
         self.potentials = xp.array(potentials)
 
     def compute_current(self):
@@ -423,12 +399,12 @@ class TransportSolver:
         transmission = comm.gather(self.data.transmission, root=0)
         if comm.rank != 0:
             return None, None
-        transmission = xp.concatenate(transmission, axis=1)
-        current = xp.zeros((self.config.bias.num_bias_points,))
+        transmission = np.concatenate(transmission, axis=1)
+        current = np.zeros((self.config.bias.num_bias_points,))
 
-        mu_l = self.config.electron.mu_left
         for i, bias_point in enumerate(self.bias_points):
-            mu_r = self.config.electron.mu_right + bias_point
+            # TODO: Use the capacitor model to compute the chemical potentials.
+            mu_l, mu_r, __ = self.compute_potentials(bias_point)
 
             integrand = (
                 transmission[i]
@@ -438,9 +414,6 @@ class TransportSolver:
                 )[:, None]
             )
 
-            current[i] = xp.average(
-                xp.trapz(integrand, self.data.energies, axis=0),
-                weights=self.kpoint_weights,
-            )
+            current[i] = np.average(np.trapezoid(integrand, self.data.energies, axis=0))
 
         return transmission, current
