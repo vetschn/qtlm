@@ -15,6 +15,7 @@ from pydantic import (
 from typing_extensions import Self
 
 from qtlm import xp
+import numpy as np
 
 _default_num_orbitals_per_atom = {
     "C": 13,
@@ -40,23 +41,11 @@ class BiasConfig(BaseModel):
     @model_validator(mode="after")
     def check_bias_points(self):
         """Checks if the bias points are set correctly."""
-        self.bias_points = xp.linspace(
+        self.bias_points = np.linspace(
             self.bias_start, self.bias_stop, self.num_bias_points, endpoint=True
         )
 
         return self
-
-
-class SCBAConfig(BaseModel):
-    """Options for the self-consistent Born approximation."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    phonon: bool = True
-
-    min_iterations: PositiveInt = 1
-    max_iterations: PositiveInt = 10
-    convergence_tol: PositiveFloat = 1e-5
 
 
 class ElectronConfig(BaseModel):
@@ -69,9 +58,6 @@ class ElectronConfig(BaseModel):
 
     fermi_level: float
 
-    mu_left: float
-    mu_right: float
-
     temperature: PositiveFloat = 300.0  # K
 
     energy_start: float
@@ -79,7 +65,10 @@ class ElectronConfig(BaseModel):
     energy_window_num: PositiveInt | None = None
     energy_step: float | None = None
 
-    energy_batch_size: PositiveInt = 100
+    kpts_size: tuple[PositiveInt, PositiveInt, PositiveInt]
+
+    energy_batch_size: PositiveInt = 128
+    kpt_batch_size: PositiveInt = 4096
 
     energies: None = None
 
@@ -106,15 +95,23 @@ class ElectronConfig(BaseModel):
 
         return self
 
+    @model_validator(mode="after")
+    def kpts_size_to_tuple(self) -> Self:
+        """Transforms list to tuple."""
+        self.kpts_size = tuple(self.kpts_size)
+        return self
 
-class PhononConfig(BaseModel):
-    """Options for the thermal degrees of freedom."""
+
+class GrapheneCapacitorConfig(BaseModel):
+    """Options for the capacitor model."""
 
     model_config = ConfigDict(extra="forbid")
 
-    energy: NonNegativeFloat
-    deformation_potential: NonNegativeFloat
-    temperature: PositiveFloat = 300.0  # K
+    # --- Capacitor parameters ----------------------------------------
+    plate_separation: Literal["auto"] | PositiveFloat = "auto"  # m
+    fermi_velocity: PositiveFloat = 1.02e6  # m/s
+
+    dielectric_permittivity: PositiveFloat = 3.4  # relative permittivity
 
 
 class DeviceConfig(BaseModel):
@@ -129,6 +126,9 @@ class DeviceConfig(BaseModel):
     num_orbitals_per_atom: dict[str, int] = Field(
         default_factory=lambda: _default_num_orbitals_per_atom
     )
+
+    capacitor_model = Literal["none", "graphene"] = "none"
+    graphene_capacitor: GrapheneCapacitorConfig = GrapheneCapacitorConfig()
 
     @model_validator(mode="after")
     def region_to_tuple(self) -> Self:
@@ -146,10 +146,8 @@ class QTLMConfig(BaseModel):
     # --- Simulation parameters ---------------------------------------
     device: DeviceConfig
     bias: BiasConfig = BiasConfig()
-    scba: SCBAConfig = SCBAConfig()
 
     electron: ElectronConfig
-    phonon: PhononConfig | None = None
 
     # --- Directory paths ----------------------------------------------
     config_dir: Path
