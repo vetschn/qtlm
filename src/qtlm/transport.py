@@ -13,6 +13,11 @@ from qtlm.statistics import fermi_dirac
 from qtlm.capacitor import compute_capacitor_potentials
 from qtlm.constants import epsilon_0
 
+if xp.__name__ == "cupy":
+    import cupyx as cpx
+else:
+    cpx = None
+
 
 comm = pkl5.Intracomm(comm)
 
@@ -70,11 +75,14 @@ class TransportData:
             (
                 solver.config.bias.num_bias_points,
                 solver.energies.size,
-                solver.kpts.size,
+                solver.kpts.shape[0],
             )
         )
         self.bias_points = solver.config.bias.bias_points
+
         self.energies = solver.config.electron.energies
+        if xp.__name__ == "cupy":
+            self.energies = xp.asnumpy(self.energies)
 
     def write(self):
         """Gathers and writes the transport data to a file."""
@@ -92,6 +100,8 @@ class TransportData:
             "transmission": transmission,
             "current": current,
             "potentials": self.solver.potentials,
+            "mu_ls": self.solver.mu_ls,
+            "mu_rs": self.solver.mu_rs,
         }
 
         for key, value in outputs.items():
@@ -117,6 +127,7 @@ class TransportSolver:
         self.energies: NDArray = xp.array_split(config.electron.energies, comm.size)[
             comm.rank
         ]
+        self.fermi_level = config.electron.fermi_level
         self.energy_batch_size = config.electron.energy_batch_size
         self.transport_axis = "xyz".index(self.config.device.transport_direction)
 
@@ -131,9 +142,11 @@ class TransportSolver:
         self.data = TransportData(self)
 
         if comm.rank == 0:
-            print(f"Number of k-points: {self.kpts}", flush=True)
+            print(f"Number of k-points: {self.kpts.shape[0]}", flush=True)
             print(f"Number of orbitals: {self.orbital_positions.shape[0]}", flush=True)
-            print(f"Number of energy points: {self.energies.shape[0]}", flush=True)
+            print(
+                f"Number of local energy points: {self.energies.shape[0]}", flush=True
+            )
 
         free_mempool()
 
@@ -153,7 +166,7 @@ class TransportSolver:
 
         repeats = np.vectorize(self.config.device.num_orbitals_per_atom.get)(atom_types)
         self.orbital_positions = np.repeat(atom_positions, repeats, axis=0)
-        
+
         # Check that the hamiltonian and overlap matrices have the correct shape.
         if self.h_r.shape[-1] != self.orbital_positions.shape[0]:
             raise ValueError(
@@ -288,10 +301,24 @@ class TransportSolver:
         """
 
         # Assemble Hamiltonian and overlap matrices for the given kpts.
-        phases = xp.einsum("ik,jk->ij", self.kpts[kpt_slice], self.r, optimize=True)
-        phase_factors = np.exp(2j * np.pi * phases)
-        h_k = xp.einsum("ij,jkl->ikl", phase_factors, self.h_r, optimize=True)
-        s_k = xp.einsum("ij,jkl->ikl", phase_factors, self.s_r, optimize=True)
+        # NOTE: This can be skipped if the previous kpt slice is the
+        # same as the current one.
+        self._previous_kpt_slice = getattr(
+            self, "_previous_kpt_slice", slice(None, None)
+        )
+        if (
+            self._previous_kpt_slice is None
+            or self._previous_kpt_slice.start != kpt_slice.start
+            or self._previous_kpt_slice.stop != kpt_slice.stop
+        ):
+            self._previous_kpt_slice = kpt_slice
+            phases = xp.einsum("ik,jk->ij", self.kpts[kpt_slice], self.r)
+            phase_factors = np.exp(2j * np.pi * phases)
+            self._h_k = xp.einsum("ij,jkl->ikl", phase_factors, self.h_r)
+            self._s_k = xp.einsum("ij,jkl->ikl", phase_factors, self.s_r)
+
+        h_k = self._h_k
+        s_k = self._s_k
 
         # Construct the potential.
         potential = self.potential.reshape(1, -1)
@@ -303,10 +330,9 @@ class TransportSolver:
                 "i,jkl->ijkl",
                 (self.energies[energy_slice] + 1j * self.config.electron.eta_contact),
                 s_k[..., *self.inds_ll],
-                optimize=True,
             )
             - h_k[..., *self.inds_ll]
-            - potential[..., *self.inds_ll]
+            + potential[..., *self.inds_ll]
         )
         g_l = linalg.inv(system_matrix_l)
 
@@ -315,10 +341,9 @@ class TransportSolver:
                 "i,jkl->ijkl",
                 (self.energies[energy_slice] + 1j * self.config.electron.eta_contact),
                 s_k[..., *self.inds_rr],
-                optimize=True,
             )
             - h_k[..., *self.inds_rr]
-            - potential[..., *self.inds_rr]
+            + potential[..., *self.inds_rr]
         )
         g_r = linalg.inv(system_matrix_r)
 
@@ -330,7 +355,7 @@ class TransportSolver:
                 s_k,
             )
             - h_k
-            - potential
+            + potential
         )
 
         sigma_l: NDArray = (
@@ -346,15 +371,25 @@ class TransportSolver:
         gamma_l = 1j * (sigma_l - sigma_l.conj().swapaxes(-1, -2))
         gamma_r = 1j * (sigma_r - sigma_r.conj().swapaxes(-1, -2))
 
-        self.data.transmission[bias_ind, energy_slice, kpt_slice] = np.trace(
+        transmission = xp.trace(
             gamma_l @ g_c @ gamma_r @ g_c.conj().swapaxes(-1, -2),
             axis1=-2,
             axis2=-1,
         ).real
 
+        if cpx is not None:
+            # Use pinned memory to transfer data to the host.
+            transmission_cpu = cpx.empty_like_pinned(transmission)
+            xp.asnumpy(transmission, out=transmission_cpu)
+            transmission = transmission_cpu
+
+        self.data.transmission[bias_ind, energy_slice, kpt_slice] = transmission
+
     def _construct_potential(self, bias_point):
         """Constructs the potential for the given bias point."""
         *__, phi = self.compute_potentials(bias_point)
+        if comm.rank == 0:
+            print(f"Computed effective electrostatic potential {phi:.2f} V", flush=True)
         potential_drop = _linear_potential(
             phi,
             self.orbital_positions[self.inds_l][:, self.transport_axis].max(),
@@ -380,8 +415,8 @@ class TransportSolver:
         kpt_slices = [
             slice(arr.min(), arr.max() + 1)
             for arr in np.array_split(
-                np.arange(self.kpts.size),
-                self.kpts.size // min(self.kpt_batch_size, self.kpts.size),
+                np.arange(self.kpts.shape[0]),
+                self.kpts.shape[0] // min(self.kpt_batch_size, self.kpts.shape[0]),
             )
         ]
         potentials = []
@@ -420,9 +455,17 @@ class TransportSolver:
         transmission = np.concatenate(transmission, axis=1)
         current = np.zeros((self.config.bias.num_bias_points,))
 
+        self.mu_ls = np.zeros_like(self.bias_points)
+        self.mu_rs = np.zeros_like(self.bias_points)
+
         for i, bias_point in enumerate(self.bias_points):
-            # TODO: Use the capacitor model to compute the chemical potentials.
-            mu_l, mu_r, __ = self.compute_potentials(bias_point)
+            # Use the capacitor model to compute the chemical potentials.
+            mu_l, mu_r, phi = self.compute_potentials(bias_point)
+            mu_l = mu_l + self.fermi_level - phi
+            mu_r = mu_r + self.fermi_level
+
+            self.mu_ls[i] = mu_l
+            self.mu_rs[i] = mu_r
 
             integrand = (
                 transmission[i]
