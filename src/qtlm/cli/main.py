@@ -23,6 +23,7 @@ qtlm_cli = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
     rich_markup_mode="markdown",
+    pretty_exceptions_show_locals=False,
 )
 
 

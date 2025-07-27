@@ -28,3 +28,9 @@ def main(config_file: Path):
         solver.solve()
 
     solver.data.write()
+
+    if comm.rank == 0:
+        print(
+            f"Transport calculation finished. Results written to {solver.config.output_dir}.",
+            flush=True,
+        )
