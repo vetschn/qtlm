@@ -47,6 +47,26 @@ def transport(
 
     transport.main(config)
 
+@qtlm_cli.command(no_args_is_help=True)
+def scattering(
+    config: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+            help="Path to TOML config file.",
+        ),
+    ],
+):
+    """Computes electron-photon scattering through the structure."""
+    secho_header()
+
+    from qtlm.cli import scattering
+
+    scattering.main(config)
+
 
 def version_callback(value: bool):
     """Prints the version/header and exits."""

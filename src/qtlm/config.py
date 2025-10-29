@@ -102,6 +102,50 @@ class ElectronConfig(BaseModel):
         self.kpt_grid = tuple(self.kpt_grid)
         return self
 
+class PhotonConfig(BaseModel):
+    """Options for the photon subsystem solver."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    energy_start: PositiveFloat
+    energy_stop: PositiveFloat
+    energy_window_num: PositiveInt | None = None
+    energy_step: float | None = None
+
+
+    energy_batch_size: PositiveInt = 128
+
+    energies: None = None
+
+    @model_validator(mode="after")
+    def check_energies(self):
+        """Check if 'energy_window_num' and 'energy_step' are set."""
+        if self.energy_window_num is not None and self.energy_step is not None:
+            raise ValueError(
+                "Only one of 'energy_window_num' or 'energy_step' should be set."
+            )
+
+        if self.energy_window_num is not None:
+            self.energies = xp.linspace(
+                self.energy_start,
+                self.energy_stop,
+                self.energy_window_num,
+            )
+        elif self.energy_step is not None:
+            self.energies = xp.arange(
+                self.energy_start,
+                self.energy_stop,
+                self.energy_step,
+            )
+
+        return self
+
+    @model_validator(mode="after")
+    def kpts_size_to_tuple(self) -> Self:
+        """Transforms list to tuple."""
+        self.kpt_grid = tuple(self.kpt_grid)
+        return self
+
 
 class GrapheneCapacitorConfig(BaseModel):
     """Options for the capacitor model."""

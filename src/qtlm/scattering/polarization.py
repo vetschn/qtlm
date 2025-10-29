@@ -1,4 +1,3 @@
-
 import time
 
 import opt_einsum as oe
@@ -11,44 +10,33 @@ from qtlm.scattering.device import Device
 from qtlm.constants import hbar, mu_0
 
 from qtlm.scattering.device import Device
+from qtlm.config import QTLMConfig
 
 device = Device()
+
+
 # for initialization
 class Polarization:
-    
+
     def __init__(
         self,
-        electron_energies: NDArray,
-        photon_energies: NDArray,
+        config: QTLMConfig,
     ) -> None:
-
         """
-        Initialize the PiPhoton object.
-        quatrex_config: QuatrexConfig object with general configuration
-        compute_config: ComputeConfig object with compute-specific configuration
-        energies: (nE,) uniformly spaced energies (eV).
-        photon_energies: (nω,) uniformly spaced photon energies (eV)
-
+        Initialize the Polarization solver.
+        config: QTLMConfig
         """
 
         # small usefull informations
-        self.electron_energies = electron_energies
-        self.photon_energies = photon_energies
+        self.electron_energies = config.electron.energies
+        self.photon_energies = config.photon.energies
         self.ne = len(self.electron_energies)
         self.prefactor = 1j * mu_0 * (1 / (2 * xp.pi))
 
-        self.dE = xp.diff(electron_energies).mean()
-        self.dhw = xp.diff(photon_energies).mean()
+        self.dE = xp.diff(self.electron_energies).mean()
+        self.dhw = xp.diff(self.photon_energies).mean()
 
-
-
-
-    def compute(
-        self,
-        g_lesser: NDArray,
-        g_greater: NDArray,
-        out: tuple[NDArray, ...],
-    ) -> None:
+    def compute(self, g_lesser: NDArray, g_greater: NDArray) -> None:
         """
         Compute Π^(ω) using FFTs to turn the energy convolution into a time product.
 
@@ -58,21 +46,23 @@ class Polarization:
         Returns:
         p_polarization:         (Np, N, N, 3, 3) complex
         """
-        pi_lesser, pi_greater, pi_retarded = out
+        # pi_lesser, pi_greater, pi_retarded = out
 
-        if not xp.allclose(xp.diff(self.electron_energies), self.dE, rtol=1e-6, atol=1e-12):
+        if not xp.allclose(
+            xp.diff(self.electron_energies), self.dE, rtol=1e-6, atol=1e-12
+        ):
             raise ValueError("energy_grid should be uniformly spaced for FFT")
 
-        if not xp.allclose(xp.diff(self.photon_energies), self.dhw, rtol=1e-6, atol=1e-12):
+        if not xp.allclose(
+            xp.diff(self.photon_energies), self.dhw, rtol=1e-6, atol=1e-12
+        ):
             raise ValueError("photon_energy should be uniformly spaced for FFT")
 
         if not xp.isclose(self.dhw, self.dE):
             raise ValueError(
                 f"Mismatch in spacing : Δω={self.dhw:.3e} vs ΔEs={self.dE:.3e}"
             )
-        
 
-       
         n = g_lesser.shape[0] + g_greater.shape[0] - 1
         print("padding:", n)
         print("G_greater shape:", g_greater.shape)
@@ -144,11 +134,11 @@ class Polarization:
         # select only those frequencies and corresponding polarization values
         p_polarization_selected = Pi_omega_full[idx, ...]  # (Nw, N, N, 3, 3)
 
-        pi_lesser[...] += p_polarization_selected
+        pi_lesser = p_polarization_selected
         # --- detailed balance: Π^>(ω) = iΠ^<(-hbarω) ---
-        pi_greater[...] += xp.conj(
-            pi_lesser[::-1].transpose(0, 2, 1, 4, 3)
+        pi_greater = -xp.conj(
+            pi_lesser[::-1]
         )  # reorders the axes : to keeps axis 0 (energy) first,then swaps 1<->2 (i <-> j) and 3<->4 (u <-> v).
-        pi_retarded[...] += 0.5 * (pi_lesser - pi_greater)
+        # pi_retarded = 0.5 * (pi_lesser - pi_greater)
 
-
+        return pi_lesser, pi_greater

@@ -1,452 +1,84 @@
+import numpy as np
+from ase.dft import kpoints
 
-import time
+from qtlm import NDArray, linalg, xp
+from qtlm.config import PhotonConfig
+from qtlm.scattering.device import Device
+from qtlm.statistics import fermi_dirac
 
-from qttools import NDArray, _DType, sparse, xp
-from qttools.comm import comm
-from qttools.datastructures import DSDBSparse
-
-# Mat multi
-from qttools.datastructures.routines import bd_matmul_distr, bd_sandwich_distr
-
-# Get Open Boundary Conditions
-from qttools.greens_function_solver.solver import OBCBlocks
-from qttools.utils.gpu_utils import get_host, synchronize_device
-from qttools.utils.mpi_utils import distributed_load, get_local_slice, get_section_sizes
-
-# for computation of sparsity_pattern
-from qttools.utils.sparse_utils import product_sparsity_pattern_dsdbsparse
-from quatrex.core.compute_config import ComputeConfig
-from quatrex.core.quatrex_config import QuatrexConfig
-
-# Import for the Class
-from quatrex.core.subsystem import SubsystemSolver
-from quatrex.core.utils import (
-    compute_num_connected_blocks,
-    get_periodic_superblocks,
-    homogenize,
-)
-
-
-
-# maps where the structure of nonzeros will land and builds a COO matrix to reprensent the pattern
-def _compute_sparsity_pattern(
-    *matrices: DSDBSparse, dtype: _DType = None
-) -> sparse.coo_matrix:
-    """Computes the sparsity pattern of the product of several DSDBSparse matrices."""
-    num_blocks = matrices[0].num_blocks
-    local_blocks, _ = get_section_sizes(num_blocks, comm.block.size)
-    start_block = sum(local_blocks[: comm.block.rank])
-    end_block = start_block + local_blocks[comm.block.rank]
-    rows, cols = product_sparsity_pattern_dsdbsparse(
-        *matrices, start_block=start_block, end_block=end_block, spillover=True
-    )
-    shape = matrices[0].shape[-2:]
-    dtype = dtype or matrices[0].dtype
-    return sparse.coo_matrix(
-        (xp.ones_like(rows), (rows, cols)), shape=shape, dtype=dtype
-    )
+device = Device()
 
 
 class PhotonSolver:
-    """Solves the dynamics of the transveral part of the field.
 
-    Parameters
-    ----------
-    quatrex_config : QuatrexConfig
-        The quatrex simulation configuration.
-    compute_config : ComputeConfig
-        The compute configuration.
-    energies : NDArray
-        The energies at which to solve.
+    def __init__(self, config: PhotonConfig):
+        self.config = config
+        self.energies = config.energies
+        self.num_energies = self.energies.size
+        self.system_matrix = None
 
-    Outputs
-    -------
-    out : tuple[DSDBSparse, ...]
-    """
+    def _assemble_system_matrix(self, pi_retarded: NDArray):
+        """Assembles the system matrix for the electron solver."""
+        # phases = xp.einsum("ik,jk->ij", device.kpts[kpt_slice], device.r_vectors)
 
-    system = "photon"
+        self.system_matrix = xp.broadcast_to(
+            xp.eye(3),
+            (self.num_energies, device.num_orbitals, device.num_orbitals, 3, 3),
+        )
+        -xp.einsum("eij,ejkmn->eikmn", device.compute_d0(self.energies), pi_retarded)
 
-    def __init__(
-        self,
-        quatrex_config: QuatrexConfig,
-        compute_config: ComputeConfig,
-        photon_energies: NDArray,
-        sparsity_pattern: sparse.coo_matrix,
-    ) -> None:
-        """iInitializes the solver."""
-        super().__init__(quatrex_config, compute_config,photon_energies) #calls the parent class’s constructor. Should the energy be added there?
+    def _compute_obc(self):
+        """Computes the open boundary conditions."""
+        d_l = linalg.inv(self.system_matrix[:, *device.inds_ll, ...])
 
-        self.local_energies = get_local_slice(photon_energies, comm.stack)  #Returns the local slice of a distributed array. -  to work on in parallel.
-        
-        self.photon_energies = photon_energies
+        d_r = linalg.inv(self.system_matrix[:, *device.inds_rr, ...])
 
-        # LOAD distances
-
-        # Memory Allocation
-        # Allocate memory for the system_matrix M: M Pattern is the pattern of D_0 times Polarizationn (I - D0 @ P).
-        M_sparsity_pattern = _compute_sparsity_pattern(
-            self.photon_matrix,
-            self.photon_matrix,
-            dtype=xp.float32,
+        pi_retarded_l: NDArray = (
+            self.system_matrix[:, *device.inds_cl, ...]
+            @ d_l
+            @ self.system_matrix[:, *device.inds_lc, ...]
+        )
+        pi_retarded_r: NDArray = (
+            self.system_matrix[:, *device.inds_cr, ...]
+            @ d_r
+            @ self.system_matrix[:, *device.inds_rc, ...]
         )
 
-        self.system_matrix = compute_config.dsdbsparse_type.from_sparray(
-            M_sparsity_pattern.astype(xp.complex128),
-            block_sizes=self.photon_block_sizes,
-            global_stack_shape=self.photon_energies.shape,
-        )
-        self.system_matrix.free_data()
-        # Explicitely try to free the memory for the sparsity pattern.
-        del M_sparsity_pattern
+        # gamma_r = 1j * (pi_retarded_r - pi_retarded_r.conj().swapaxes(-2, -1))
+        # gamma_l = 1j * (pi_retarded_l - pi_retarded_l.conj().swapaxes(-2, -1))
 
-        # Allocate memory for the Term B_lesser and B_greater: B = (D0@deltaT) @ PI @ (D0@deltaT)^T
-        B_sparsity_pattern = _compute_sparsity_pattern(
-            self.photon_matrix,
-            self.photon_matrix,  # TODO: check how many times this pattern is wished
-            self.photon_matrix,
-            dtype=xp.float32,
-        )
+        # sigma_lesser = (
+        #     1j * self.occupancies_r * gamma_r + 1j * self.occupancies_l * gamma_l
+        # )
 
-        self.B_lesser = compute_config.dsdbsparse_type.from_sparray(
-            B_sparsity_pattern.astype(xp.complex128),
-            block_sizes=self.photon_block_sizes,
-            global_stack_shape=self.photon_energies.shape,
-            symmetry=quatrex_config.scba.symmetric,
-            symmetry_op=lambda a: -a.conj(),
-        )
-        self.B_greater = compute_config.dsdbsparse_type.zeros_like(self.B_lesser)
-        # Explicitely try to free the memory for the sparsity pattern.
-        del B_sparsity_pattern
-        self.B_greater.free_data()
-        self.B_lesser.free_data()
+        # sigma_greater = (
+        #     1j * (1 - self.occupancies_r) * gamma_r
+        #     + 1j * (1 - self.occupancies_l) * gamma_l
+        # )
 
-        # Boundary conditions.
-        # Optional: Numerical hilfe for convergence
-        self.dos_peak_limit = quatrex_config.photon.dos_peak_limit
-        self.obc_blocks = OBCBlocks(num_blocks=self.system_matrix.num_local_blocks)
-        self.block_sections = quatrex_config.photon.obc.block_sections
-        self.solve_call_count = 0
-        self.filtering_iteration_limit = quatrex_config.photon.filtering_iteration_limit
-
-    def _set_block_sizes(self, block_sizes: NDArray) -> None:
-        """Sets the block sizes of all matrices.
-
-        Parameters
-        ----------
-        block_sizes : NDArray
-            The new block sizes.
-
-        """
-        self.system_matrix.block_sizes = block_sizes
-        self.B_lesser.block_sizes = block_sizes
-        self.B_greater.block_sizes = block_sizes
-
-    def _compute_obc(self) -> None:
-        """Computes open boundary conditions."""
-        # TODO: LEFT OBC: Init rank !=0
-
-        # LEFT CONTACT OBC: Surface Greens function: Lyaponoc
-
-        m_10, m_00, m_01 = get_periodic_superblocks(
-            a_ii=self.system_matrix.blocks[0, 0],
-            a_ji=self.system_matrix.blocks[1, 0],
-            a_ij=self.system_matrix.blocks[0, 1],
-            block_sections=self.block_sections,
-        )
-        x_00 = self.obc(a_ii=m_00, a_ij=m_01, a_ji=m_10, contact="left")
-        m_10_x_00 = m_10 @ x_00
-        self.obc_blocks.retarded[0] = m_10_x_00 @ m_01
-
-        t_lyapunov_start = time.perf_counter()
-        # Compute and apply the left lesser/greater boundary self-energy.
-        a_00_lesser = m_10_x_00 @ self.B_lesser.blocks[0, 1]
-        a_00_greater = m_10_x_00 @ self.B_greater.blocks[0, 1]
-
-        q_00_lesser = (
-            x_00
-            @ (
-                self.B_lesser.blocks[0, 0]
-                - (a_00_lesser - a_00_lesser.conj().swapaxes(-1, -2))
-            )
-            @ x_00.conj().swapaxes(-1, -2)
-        )
-        q_00_greater = (
-            x_00
-            @ (
-                self.B_greater.blocks[0, 0]
-                - (a_00_greater - a_00_greater.conj().swapaxes(-1, -2))
-            )
-            @ x_00.conj().swapaxes(-1, -2)
-        )
-
-        b_00 = x_00 @ m_10
-        q_00 = xp.stack((q_00_lesser, q_00_greater))
-
-        d_00_lesser, d_00_greater = self.lyapunov(b_00, q_00, "left")
-
-        self.obc_blocks.lesser[0] = m_10 @ d_00_lesser @ m_10.conj().swapaxes(
-            -1, -2
-        ) - (a_00_lesser - a_00_lesser.conj().swapaxes(-1, -2))
-        self.obc_blocks.greater[0] = m_10 @ d_00_greater @ m_10.conj().swapaxes(
-            -1, -2
-        ) - (a_00_greater - a_00_greater.conj().swapaxes(-1, -2))
-
-        # Lyapunov
-        synchronize_device()
-        t_lyapunov_end = time.perf_counter()
-        comm.stack.barrier()
-        t_lyapunov_end_all = time.perf_counter()
-        if comm.stack.rank == 0:
-            print(
-                f"        Lyapunov: {t_lyapunov_end-t_lyapunov_start:.3f}", flush=True
-            )
-            print(
-                f"        Lyapunov all: {t_lyapunov_end_all-t_lyapunov_start:.3f}",
-                flush=True,
-            )
-
-        # RIGHT CONTACT OBC: Surface Greens function: Lyaponoc
-        n = self.system_matrix.num_local_blocks - 1
-        m = n - 1
-
-        # METHOD: function get_periodic_superblocks is implemented in one way so when going from right to left need to do this trick of flipping and bop
-        m_mn, m_nn, m_nm = get_periodic_superblocks(
-            # Twist it, flip it, ...
-            a_ii=xp.flip(self.system_matrix.blocks[n, n], axis=(-2, -1)),
-            a_ji=xp.flip(self.system_matrix.blocks[m, n], axis=(-2, -1)),
-            a_ij=xp.flip(self.system_matrix.blocks[n, m], axis=(-2, -1)),
-            block_sections=self.block_sections,
-        )
-        # ... bop it.
-        m_nn = xp.flip(m_nn, axis=(-2, -1))
-        m_nm = xp.flip(m_nm, axis=(-2, -1))
-        m_mn = xp.flip(m_mn, axis=(-2, -1))
-        x_nn = self.obc(
-            # Twist it, flip it, ...
-            a_ii=xp.flip(m_nn, axis=(-2, -1)),
-            a_ij=xp.flip(m_nm, axis=(-2, -1)),
-            a_ji=xp.flip(m_mn, axis=(-2, -1)),
-            contact="right",
-        )
-        # ... bop it.
-        x_nn = xp.flip(x_nn, axis=(-2, -1))
-        m_mn_x_nn = m_mn @ x_nn
-
-        self.obc_blocks.retarded[-1] = m_mn_x_nn @ m_nm
-
-        # Compute and apply the right lesser/greater boundary self-energy.
-        a_nn_lesser = m_mn_x_nn @ self.B_lesser.blocks[n, m]
-        a_nn_greater = m_mn_x_nn @ self.B_greater.blocks[n, m]
-
-        q_nn_lesser = (
-            x_nn
-            @ (
-                self.B_lesser.blocks[n, n]
-                - (a_nn_lesser - a_nn_lesser.conj().swapaxes(-1, -2))
-            )
-            @ x_nn.conj().swapaxes(-1, -2)
-        )
-        q_nn_greater = (
-            x_nn
-            @ (
-                self.B_greater.blocks[n, n]
-                - (a_nn_greater - a_nn_greater.conj().swapaxes(-1, -2))
-            )
-            @ x_nn.conj().swapaxes(-1, -2)
-        )
-
-        b_nn = x_nn @ m_mn
-        q_nn = xp.stack((q_nn_lesser, q_nn_greater))
-
-        d_nn_lesser, d_nn_greater = self.lyapunov(b_nn, q_nn, "right")
-
-        self.obc_blocks.lesser[-1] = m_mn @ d_nn_lesser @ m_mn.conj().swapaxes(
-            -1, -2
-        ) - (a_nn_lesser - a_nn_lesser.conj().swapaxes(-1, -2))
-
-        self.obc_blocks.greater[-1] = m_mn @ d_nn_greater @ m_mn.conj().swapaxes(
-            -1, -2
-        ) - (a_nn_greater - a_nn_greater.conj().swapaxes(-1, -2))
-
-    # ASSEMBLE system_matrix: M = I - D_0 @ Pi
-    def _assemble_system_matrix(self, p_retarded: DSDBSparse) -> None:
-        """Assembles the system matrix."""
-
-        self.system_matrix.data = 0.0
-        local_blocks, _ = get_section_sizes(
-            len(self.system_matrix.block_sizes), comm.block.size
-        )
-        start_block = sum(local_blocks[: comm.block.rank])
-        end_block = start_block + local_blocks[comm.block.rank]
-
-        bd_matmul_distr(
-            self.D0_matrix,
-            p_retarded,
-            out=self.system_matrix,
-            start_block=start_block,
-            end_block=end_block,
-            spillover_correction=True,
-        )
-        xp.negative(self.system_matrix.data, out=self.system_matrix.data)
-        self.system_matrix += sparse.eye(self.system_matrix.shape[-1])  # I- D0Pi?
+        pi_retarded = pi_retarded_l + pi_retarded_r
+        return pi_retarded
 
     def solve(
         self,
-        p_lesser: DSDBSparse,
-        p_greater: DSDBSparse,
-        p_retarded: DSDBSparse,
-        out: tuple[DSDBSparse, ...],
-    ) -> None:
-        """Solves for the transversal part of the field.
+        pi_lesser: NDArray,
+        pi_greater: NDArray,
+    ):
+        """Main solver routine."""
+        self._assemble_system_matrix((pi_greater - pi_lesser) / 2)
+        pi_obc_lesser, pi_obc_greater, pi_obc_retarded = self._compute_obc()
 
-        Parameters
-        ----------
-        p_lesser : DSDBSparse
-            The lesser transversal polarization.
-        p_greater : DSDBSparse
-            The greater transversal polarization.
-        p_retarded : DSDBSparse
-            The retarded transversal polarization.
-        out : tuple[DSDBSparse, ...]
-            The output matrices. The order is (lesser, greater,
-            retarded).
-
-        """
-
-        t_set_blocksize_start = time.perf_counter()
-
-        self.system_matrix.allocate_data()
-        self.B_lesser.allocate_data()
-        self.B_greater.allocate_data()
-        self.D0_matrix.allocate_data()
-        self.D0_delta.allocate_data()
-        # Update: Change the block element sizes to match the Photon matrix o RGF Algo possible.
-        self._set_block_sizes(self.small_block_sizes)
-
-        synchronize_device()
-        t_set_blocksize_end = time.perf_counter()
-        comm.barrier()
-        t_set_blocksize_end_all = time.perf_counter()
-        if comm.rank == 0:
-            print(
-                f"    Set block sizes: {t_set_blocksize_end-t_set_blocksize_start:.3f}",
-                flush=True,
-            )
-            print(
-                f"    Set block sizes all: {t_set_blocksize_end_all-t_set_blocksize_start:.3f}",
-                flush=True,
-            )
-
-        # STEP1: Assemble the system matrix (Includes matrix multiplication): M = I-Do(w)Polarization(w).
-        self._assemble_system_matrix(p_retarded)  # UPDATES the values matrix system_matrix
-
-        # STEP2: Get the overall intermediate term B lesser greater
-        local_blocks, _ = get_section_sizes(
-            len(self.photon_matrix.block_sizes), comm.block.size
+        # Solve.
+        d_retarded = linalg.inv(self.system_matrix - pi_obc_retarded)
+        d_lesser = (
+            d_retarded
+            @ (pi_lesser + pi_obc_lesser)
+            @ d_retarded.conj().swapaxes(-2, -1)
         )
-        start_block = sum(local_blocks[: comm.block.rank])
-        end_block = start_block + local_blocks[comm.block.rank]
-
-        # Compute B lesser and greater :  Ddelta*Pola*Ddelta
-        bd_sandwich_distr(
-            self.D0_delta,
-            p_lesser,
-            out=self.B_lesser,
-            start_block=start_block,
-            end_block=end_block,  # let them empty
-            spillover_correction=True,
+        d_greater = (
+            d_retarded
+            @ (pi_greater + pi_obc_greater)
+            @ d_retarded.conj().swapaxes(-2, -1)
         )
 
-        bd_sandwich_distr(
-            self.D0_delta,
-            p_greater,
-            out=self.B_greater,
-            start_block=start_block,
-            end_block=end_block,
-            spillover_correction=True,
-        )
-        # Go back to normal block sizes.
-        t_set_blocksize_start = time.perf_counter()
-        self._set_block_sizes(self.photon_block_sizes)
-
-        t_set_blocksize_end = time.perf_counter()
-        comm.barrier()
-        t_set_blocksize_end_all = time.perf_counter()
-        if comm.rank == 0:
-            print(
-                f"    Set block sizes: {t_set_blocksize_end-t_set_blocksize_start:.3f}",
-                flush=True,
-            )
-            print(
-                f"    Set block sizes all: {t_set_blocksize_end_all-t_set_blocksize_start:.3f}",
-                flush=True,
-            )
-
-        # Apply the OBC algorithm.
-        t_obc_start = time.perf_counter()
-        self._compute_obc()
-        synchronize_device()
-        t_obc_end = time.perf_counter()
-        comm.barrier()
-        t_obc_end_all = time.perf_counter()
-        if comm.rank == 0:
-            print(f"    OBC: {t_obc_end-t_obc_start:.3f}", flush=True)
-            print(f"    OBC all: {t_obc_end_all-t_obc_start:.3f}", flush=True)
-
-        # Solve the system via RGF Algo
-        if comm.block.size > 1:
-            t_solve_start = time.perf_counter()
-            self.solver_dist.selected_solve(
-                a=self.system_matrix,  # M
-                sigma_lesser=self.B_lesser,  # B Lesser
-                sigma_greater=self.B_greater,  # B Greater
-                obc_blocks=self.obc_blocks,
-                out=out,
-                return_retarded=False,
-            )
-            synchronize_device()
-            t_solve_end = time.perf_counter()
-            comm.barrier()
-            t_solve_end_all = time.perf_counter()
-            if comm.rank == 0:
-                print(f"    Solve: {t_solve_end-t_solve_start:.3f}", flush=True)
-                print(
-                    f"    Solve all: {t_solve_end_all-t_solve_start:.3f}",
-                    flush=True,
-                )
-
-        else:
-            t_solve_start = time.perf_counter()
-            self.solver.selected_solve(
-                a=self.system_matrix,
-                sigma_lesser=self.B_lesser,
-                sigma_greater=self.B_greater,
-                obc_blocks=self.obc_blocks,
-                out=out,
-                return_retarded=False,
-            )
-            synchronize_device()
-            t_solve_end = time.perf_counter()
-            comm.barrier()
-            t_solve_end_all = time.perf_counter()
-            if comm.rank == 0:
-                print(f"    Solve: {t_solve_end-t_solve_start:.3f}", flush=True)
-                print(
-                    f"    Solve all: {t_solve_end_all-t_solve_start:.3f}",
-                    flush=True,
-                )
-
-        # Now we have D we can say bye to the zwischen terms
-        self.system_matrix.free_data()
-        self.B_lesser.free_data()
-        self.B_greater.free_data()
-
-        # Get the result
-        d_lesser, d_greater, *__ = out
-        if comm.stack.rank == 0:
-            d_greater.data[0, :] = 0.0
-            d_lesser.data[0, :] = 0.0
-
-        self.solve_call_count += 1
-
-
+        return d_lesser, d_greater

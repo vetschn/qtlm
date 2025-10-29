@@ -4,7 +4,7 @@ from ase.dft import kpoints
 import numpy as np
 
 import scipy.sparse as sp
-from qtlm.constants import hbar, eV_to_J, c_0
+from qtlm.constants import hbar, c_0
 
 def linear_potential(v_at_pos_min: float, pos_min: float, pos_max: float) -> callable:
     """Creates a linear potential drop between two planes.
@@ -166,7 +166,7 @@ class Device:
         R_positions : (N,3) array of positions of orbitals
         E_eV_array : (M,) array of energies in eV ((invented))
         """
-        omega = photon_energies / (hbar * eV_to_J)  # angular frequencies in rad/s
+        omega = photon_energies / hbar  # angular frequencies in rad/s
         k = omega / c_0
 
         r = xp.linalg.norm(self.distances, axis=2)  # (N, N)

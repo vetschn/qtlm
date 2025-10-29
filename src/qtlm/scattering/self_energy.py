@@ -14,6 +14,7 @@ from qtlm.scattering.device import Device
 
 device = Device()
 
+
 class SelfEnergy:
     """Photon self-energy within the self-consistent Born approximation (SCBA).
 
@@ -23,23 +24,18 @@ class SelfEnergy:
       m_interaction:   (N, N, 3)   real/complex, energy-independent
     """
 
-    def __init__(
-        self,
-        energies: NDArray,
-        photon_energies: NDArray,
-    ) -> None:
+    def __init__(self, config: QTLMConfig) -> None:
 
         # grids
-        self.energies = energies
-        self.photon_energies = photon_energies
-        self.Ne = energies.size
-        self.Nw = photon_energies.size
+        self.electron_energies = config.electron.energies
+        self.photon_energies = config.photon.energies
+        self.Ne = self.electron_energies.size
+        self.Nw = self.photon_energies.size
 
         # constants
         self.prefactor = 1j * mu_0 * (1 / (2 * xp.pi))
-        self.dE = xp.diff(energies).mean()
-        self.dhw = xp.diff(photon_energies).mean()
-
+        self.dE = xp.diff(self.electron_energies).mean()
+        self.dhw = xp.diff(self.photon_energies).mean()
 
     def compute(
         self,
@@ -56,14 +52,12 @@ class SelfEnergy:
                     each of shape (Nw, N, N, 3, 3) complex
         """
 
-        s_lesser, s_greater, s_retarded = out
-
         # compute self-energy
 
-        if not xp.allclose(xp.diff(self.energies), self.dE, rtol=1e-6, atol=1e-12):
+        if not xp.allclose(xp.diff(self.electron_energies), self.dE, rtol=1e-6, atol=1e-12):
             raise ValueError("energy_grid should be uniformly spaced for FFT")
 
-        if not xp.allclose(xp.diff(self.energies), self.dhw, rtol=1e-6, atol=1e-12):
+        if not xp.allclose(xp.diff(self.electron_energies), self.dhw, rtol=1e-6, atol=1e-12):
             raise ValueError("photon_energy should be uniformly spaced for FFT")
 
         if not xp.isclose(self.dhw, self.dE):
@@ -140,7 +134,7 @@ class SelfEnergy:
         )  # in np : 0.583s | scipy : 0.149s
 
         # index array
-        idx = xp.round((self.energies - self.energies[0]) / self.dhw).astype(int)
+        idx = xp.round((self.electron_energies - self.electron_energies[0]) / self.dhw).astype(int)
 
         if xp.any((idx < 0) | (idx >= Sigma_full.shape[0])):
 
@@ -150,11 +144,5 @@ class SelfEnergy:
         # select only selected electron energies and corresponding polarization values
         sigma_selected = Sigma_full[idx, ...]  # (NE, N, N, 3, 3)
 
-        s_lesser.nonzero()
-
-        s_lesser[...] += sigma_selected
-        s_greater[...] += xp.conj(s_lesser[::-1].transpose(0, 2, 1))
+        return sigma_selected
         # s_greater[...] = -xp.conj(s_lesser.transpose(0, 2, 1, 4, 3)) #fermionic nature
-        s_retarded[...] += 0.5 * (s_lesser - s_greater)
-
-

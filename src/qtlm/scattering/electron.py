@@ -16,6 +16,8 @@ class ElectronSolver:
         self.energies = config.energies
         self.system_matrix = None
 
+        # TODO: bias setting in config
+
         # Left contact has the potential drop.
         self.occupancies_l = fermi_dirac(
             self.energies - config.fermi_level - phi, self.temperature
@@ -38,7 +40,7 @@ class ElectronSolver:
             xp.einsum(
                 "i,jkl->ijkl",
                 # (self.energies[energy_slice] + 1j * self.config.electron.eta),
-                (self.energies + 1j * self.config.electron.eta),
+                (self.energies + 1j * self.config.eta),
                 s_k,
             )
             - h_k
@@ -78,14 +80,26 @@ class ElectronSolver:
         sigma_retarded = sigma_retarded_l + sigma_retarded_r
         return sigma_lesser, sigma_greater, sigma_retarded
 
-    def solve(self):
+    def solve(
+        self,
+        sigma_lesser: NDArray,
+        sigma_greater: NDArray,
+    ):
         """Main solver routine."""
-        self._assemble_system_matrix()
+        self._assemble_system_matrix((sigma_greater - sigma_lesser) / 2)
         sigma_obc_lesser, sigma_obc_greater, sigma_obc_retarded = self._compute_obc()
 
         # Solve.
         g_retarded = linalg.inv(self.system_matrix - sigma_obc_retarded)
-        g_lesser = g_retarded @ sigma_obc_lesser @ g_retarded.conj().swapaxes(-2, -1)
-        g_greater = g_retarded @ sigma_obc_greater @ g_retarded.conj().swapaxes(-2, -1)
+        g_lesser = (
+            g_retarded
+            @ (sigma_lesser + sigma_obc_lesser)
+            @ g_retarded.conj().swapaxes(-2, -1)
+        )
+        g_greater = (
+            g_retarded
+            @ (sigma_greater + sigma_obc_greater)
+            @ g_retarded.conj().swapaxes(-2, -1)
+        )
 
-        return g_lesser, g_greater, g_retarded
+        return g_lesser, g_greater
