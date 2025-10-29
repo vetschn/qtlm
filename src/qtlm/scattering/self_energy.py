@@ -9,7 +9,11 @@ from qtlm.scattering.device import Device
 
 from qtlm.constants import mu_0
 from qtlm.config import QTLMConfig
-from qtlm.io import read_tight_binding_data
+
+from qtlm.scattering.device import Device
+
+device = Device()
+
 class SelfEnergy:
     """Photon self-energy within the self-consistent Born approximation (SCBA).
 
@@ -21,10 +25,8 @@ class SelfEnergy:
 
     def __init__(
         self,
-        qtlm_config: QTLMConfig,
         energies: NDArray,
         photon_energies: NDArray,
-        sparsity_pattern: sparse.coo_matrix = None,
     ) -> None:
 
         # grids
@@ -37,22 +39,6 @@ class SelfEnergy:
         self.prefactor = 1j * mu_0 * (1 / (2 * xp.pi))
         self.dE = xp.diff(energies).mean()
         self.dhw = xp.diff(photon_energies).mean()
-
-        # --- configuration extraction ---
-
-        # LOAD Hamiltonian (same as in electron transport)
-       
-
-
-        # LOAD distances
-
-    
-
-        # System matrix storage with photon stack shape (energies)
-        self.system_matrix
-
-        self.system_matrix.free_data()
-        del sparsity_pattern
 
 
     def compute(
@@ -72,13 +58,6 @@ class SelfEnergy:
 
         s_lesser, s_greater, s_retarded = out
 
-        #Guard 
-        if self.overlap_sparray is None:
-            self.overlap_sparray = sparse.eye(
-            self.hamiltonian.shape[-2],
-            format="coo",
-            dtype=self.hamiltonian.dtype,
-        )
         # compute self-energy
 
         if not xp.allclose(xp.diff(self.energies), self.dE, rtol=1e-6, atol=1e-12):
@@ -119,9 +98,9 @@ class SelfEnergy:
             start = time.perf_counter()
             path, path_info = oe.contract_path(
                 i,
-                self.m_interaction,
+                device.interaction_tensor,
                 G_IFFT,
-                self.m_interaction,
+                device.interaction_tensor,
                 D_IFFT,
                 optimize="optimal",
                 memory_limit="max_input",
@@ -134,9 +113,9 @@ class SelfEnergy:
 
             Term = oe.contract(
                 i,
-                self.m_interaction,
+                device.interaction_tensor,
                 G_IFFT,
-                self.m_interaction,
+                device.interaction_tensor,
                 D_IFFT,
                 optimize=path,
                 memory_limit="max_input",

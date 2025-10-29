@@ -1,26 +1,165 @@
-from qtlm.constants import e, hbar, c_0, eV_to_J
+from qtlm.io import read_tight_binding_data
 from qtlm import NDArray, xp
-import opt_einsum as oe
+from ase.dft import kpoints
+import numpy as np
+
 import scipy.sparse as sp
-eV_to_J = 1.602176634e-19  # Conversion factor from eV to Joules
+from qtlm.constants import hbar, eV_to_J, c_0
+
+def linear_potential(v_at_pos_min: float, pos_min: float, pos_max: float) -> callable:
+    """Creates a linear potential drop between two planes.
+
+    Parameters
+    ----------
+    v_at_pos_max : float
+        The potential at the maximum position.
+    pos_min : float
+        The minimum position.
+    pos_max : float
+        The maximum position.
+
+    Returns
+    -------
+    callable
+        A function that calculates the potential at a given position.
+
+    """
+
+    def potential(pos: NDArray) -> NDArray:
+        """Calculates the potential at a given position."""
+        pos = np.where(pos < pos_min, pos_min, pos)
+        pos = np.where(pos > pos_max, pos_max, pos)
+        # pot = v_at_pos_max * (pos - pos_min) / (pos_max - pos_min)
+        pot = v_at_pos_min * (pos - pos_max) / (pos_min - pos_max)
+        return pot
+
+    return potential
+
 
 class Device:
-    
-    def __init__(self):
-        self.hamiltonian = None
-        self.overlap = None
-        self.interaction_tensor = None
-        self.positions = None
-        self.distances = None
+    """Singleton class representing the simulated device."""
+
+    _instance = None
+    _is_configured = False
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(Device, cls).__new__(cls)
+
+        return cls._instance
+
+    def configure(self, config):
+        """Configures the device by loading tight-binding data."""
+        if self._is_configured:
+            raise RuntimeError("Device is already configured.")
+
+        self.config = config
+
+        # Load tight-binding data.
+        self.hamiltonian_r, self.overlap_r, self.r_vectors = read_tight_binding_data(
+            config.input_dir
+        )
+
+        # Initialize orbital positions.
+        atom_positions = np.loadtxt(
+            config.input_dir / "device.xyz",
+            dtype=float,
+            skiprows=2,
+            usecols=(1, 2, 3),
+        )
+        atom_types = np.loadtxt(
+            config.input_dir / "device.xyz", dtype=str, skiprows=2, usecols=0
+        )
+        repeats = np.vectorize(config.device.num_orbitals_per_atom.get)(atom_types)
+        self.orbital_positions = np.repeat(atom_positions, repeats, axis=0)
+
+        # Precompute distances.
+        self.distances = np.linalg.norm(self.orbital_positions, axis=1)
+
+        # Precompute interaction tensor.
+        self.interaction_tensor = self._assemble_interaction_tensor()
+
+        # Precompute k-points.
+        self.kpts: NDArray = xp.array(kpoints.monkhorst_pack(config.electron.kpt_grid))
+
+        # Initialize transport axis.
+        self.transport_axis = "xyz".index(config.device.transport_direction)
+
+        # Initialize contact indices.
+        self._init_contacts()
+
+        # TODO: Initialize potential.
+        self.potential = ...
+
+        # Mark as configured.
+        self._is_configured = True
+
+    def _assemble_interaction_tensor(self) -> NDArray: ...
+
+    def _init_contacts(self):
+        """Initializes the indices for the contact regions."""
+        start_l, stop_l = self.config.device.left_contact_region
+        start_r, stop_r = self.config.device.right_contact_region
+
+        self.inds_l = np.where(
+            (self.orbital_positions[:, self.transport_axis] >= start_l)
+            & (self.orbital_positions[:, self.transport_axis] <= stop_l)
+        )[0]
+        self.inds_r = np.where(
+            (self.orbital_positions[:, self.transport_axis] >= start_r)
+            & (self.orbital_positions[:, self.transport_axis] <= stop_r)
+        )[0]
+        # Central inds correspond to all the remaining orbitals.
+        self.inds_c = np.setdiff1d(
+            np.arange(self.orbital_positions.shape[0]), self.inds_l
+        )
+        self.inds_c = np.setdiff1d(self.inds_c, self.inds_r)
+
+        if self.inds_l.size == 0 or self.inds_r.size == 0:
+            raise ValueError(
+                "No contact regions found. Please check the contact region definitions."
+            )
+
+        # Check if the indices can be slices instead. This can prevent
+        # fancy indexing and improve memory efficiency.
+        inds_are_slices = (
+            np.array_equal(
+                self.inds_l,
+                np.arange(self.inds_l.min(), self.inds_l.max() + 1),
+            )
+            and np.array_equal(
+                self.inds_r,
+                np.arange(self.inds_r.min(), self.inds_r.max() + 1),
+            )
+            and np.array_equal(
+                self.inds_c,
+                np.arange(self.inds_c.min(), self.inds_c.max() + 1),
+            )
+        )
+        if inds_are_slices:
+            slice_l = slice(self.inds_l.min(), self.inds_l.max() + 1)
+            slice_r = slice(self.inds_r.min(), self.inds_r.max() + 1)
+            slice_c = slice(self.inds_c.min(), self.inds_c.max() + 1)
+
+            self.inds_ll = (slice_l, slice_l)
+            self.inds_rr = (slice_r, slice_r)
+            self.inds_cl = (slice_c, slice_l)
+            self.inds_cr = (slice_c, slice_r)
+            self.inds_lc = (slice_l, slice_c)
+            self.inds_rc = (slice_r, slice_c)
+            self.inds_cc = (slice_c, slice_c)
+
+        else:
+
+            self.inds_ll = np.ix_(self.inds_l, self.inds_l)
+            self.inds_rr = np.ix_(self.inds_r, self.inds_r)
+            self.inds_cl = np.ix_(self.inds_c, self.inds_l)
+            self.inds_cr = np.ix_(self.inds_c, self.inds_r)
+            self.inds_lc = np.ix_(self.inds_l, self.inds_c)
+            self.inds_rc = np.ix_(self.inds_r, self.inds_c)
+            self.inds_cc = np.ix_(self.inds_c, self.inds_c)
 
 
-        self.prefactor = (-e / 2.0) * (1j / hbar * eV_to_J)  # in SI units (C * s / J)
-
-        self.interaction_tensor  = self.prefactor * self.hamiltonian.toarray()[..., xp.newaxis] * self.distances  # CPU
-
-    # M = xp.ndarray(comp.astype(complex), dtype=complex)
-
-        
     def compute_d0(self,photon_energies):
         """
         3D tensor D0[m, i, j] of Initial Photon Green's functions between each pair (n,m) of positions
@@ -104,7 +243,4 @@ class Device:
         return out  # (Nw, N, N, 3, 3)
 
 
-    def configure():
-        ...
-    
 

@@ -9,16 +9,19 @@ from qtlm import NDArray, xp
 from qtlm.scattering.device import Device
 
 from qtlm.constants import hbar, mu_0
-from qtlm.config import QTLMConfig
+
+from qtlm.scattering.device import Device
+
+device = Device()
 # for initialization
 class Polarization:
     
     def __init__(
         self,
-        qtlm_config: QTLMConfig,
         electron_energies: NDArray,
         photon_energies: NDArray,
     ) -> None:
+
         """
         Initialize the PiPhoton object.
         quatrex_config: QuatrexConfig object with general configuration
@@ -37,19 +40,8 @@ class Polarization:
         self.dE = xp.diff(electron_energies).mean()
         self.dhw = xp.diff(photon_energies).mean()
 
-        # --- configuration extraction ---
 
-        # LOAD Hamiltonian
-       
 
-        # LOAD distances
-        
-
-        # initialise M
-        self.m_interaction = interaction_tensor(
-            distances_sparray, hamiltonian_sparray
-        ).astype(xp.complex64)
-        del hamiltonian_sparray
 
     def compute(
         self,
@@ -89,7 +81,7 @@ class Polarization:
         start_fft_timer = time.perf_counter()
         G1_FFT = xp.fft.fft(g_lesser, n, axis=0)  # (Np, N, N)
         G2_FFT = xp.fft.fft(g_greater, n, axis=0)  # (Np, N, N)
-        M = self.m_interaction.astype(xp.complex128, copy=False)
+        M = device.interaction_tensor.astype(xp.complex128, copy=False)
         end_fft_timer = time.perf_counter()
         print(
             f"fft took {end_fft_timer - start_fft_timer:.3f}s"
