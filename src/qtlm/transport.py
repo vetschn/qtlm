@@ -447,6 +447,9 @@ class TransportSolver:
             )
         self.potentials = xp.array(potentials)
 
+        # Barrier since some nodes are pretty slow compared to others.
+        comm.barrier()
+
     def compute_current(self):
         """Computes the current for the given bias points."""
         transmission = comm.gather(self.data.transmission, root=0)
@@ -462,7 +465,7 @@ class TransportSolver:
             # Use the capacitor model to compute the chemical potentials.
             mu_l, mu_r, phi = self.compute_potentials(bias_point)
             mu_l = mu_l + self.fermi_level - phi
-            mu_r = mu_r + self.fermi_level
+            mu_r = mu_r + self.fermi_level # r is top and grounded.
 
             self.mu_ls[i] = mu_l
             self.mu_rs[i] = mu_r

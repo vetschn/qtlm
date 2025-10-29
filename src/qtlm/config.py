@@ -22,6 +22,7 @@ _default_num_orbitals_per_atom = {
     "B": 13,
     "N": 13,
     "S": 13,
+    "Se": 13,
     "W": 29,
     "Mo": 29,
 }
