@@ -25,8 +25,8 @@ def main(config_file: Path):
 
     scba = SCBA(config)
 
-    with threadpool_limits(limits=2, user_api="blas"):
-        scba.run()
+    # with threadpool_limits(limits=None, user_api="blas"):
+    scba.run()
 
     print(
         f"Transport calculation finished. Results written to {scba.config.output_dir}.",

@@ -109,9 +109,7 @@ class PhotonConfig(BaseModel):
 
     energy_start: PositiveFloat
     energy_stop: PositiveFloat
-    energy_window_num: PositiveInt | None = None
     energy_step: float | None = None
-
 
     energy_batch_size: PositiveInt = 128
 
@@ -125,12 +123,6 @@ class PhotonConfig(BaseModel):
                 "Only one of 'energy_window_num' or 'energy_step' should be set."
             )
 
-        if self.energy_window_num is not None:
-            self.energies = xp.linspace(
-                self.energy_start,
-                self.energy_stop,
-                self.energy_window_num,
-            )
         elif self.energy_step is not None:
             self.energies = xp.arange(
                 self.energy_start,
@@ -140,13 +132,7 @@ class PhotonConfig(BaseModel):
 
         return self
 
-    @model_validator(mode="after")
-    def kpts_size_to_tuple(self) -> Self:
-        """Transforms list to tuple."""
-        self.kpt_grid = tuple(self.kpt_grid)
-        return self
-
-
+   
 class GrapheneCapacitorConfig(BaseModel):
     """Options for the capacitor model."""
 
@@ -193,7 +179,7 @@ class QTLMConfig(BaseModel):
     bias: BiasConfig = BiasConfig()
 
     electron: ElectronConfig
-
+    photon: PhotonConfig
     # --- Directory paths ----------------------------------------------
     config_dir: Path
     simulation_dir: Path = Path("./quatrex/")

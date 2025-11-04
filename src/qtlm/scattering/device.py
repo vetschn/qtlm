@@ -2,17 +2,18 @@ from qtlm.io import read_tight_binding_data
 from qtlm import NDArray, xp
 from ase.dft import kpoints
 import numpy as np
-
+import opt_einsum as oe
 import scipy.sparse as sp
-from qtlm.constants import hbar, c_0
+from qtlm.constants import hbar, c_0, e
+
 
 def linear_potential(v_at_pos_min: float, pos_min: float, pos_max: float) -> callable:
     """Creates a linear potential drop between two planes.
 
     Parameters
     ----------
-    v_at_pos_max : float
-        The potential at the maximum position.
+    v_at_pos_min : float
+        The potential at the minimum position.
     pos_min : float
         The minimum position.
     pos_max : float
@@ -73,14 +74,17 @@ class Device:
         repeats = np.vectorize(config.device.num_orbitals_per_atom.get)(atom_types)
         self.orbital_positions = np.repeat(atom_positions, repeats, axis=0)
 
+        self.num_orbitals = self.orbital_positions.shape[0]
         # Precompute distances.
-        self.distances = np.linalg.norm(self.orbital_positions, axis=1)
+        #self.distances = np.linalg.norm(self.orbital_positions, axis=1)
+        self.distances = self.orbital_positions[:, np.newaxis] - self.orbital_positions[np.newaxis, :] # (N, N, 3)
 
         # Precompute interaction tensor.
         self.interaction_tensor = self._assemble_interaction_tensor()
 
         # Precompute k-points.
         self.kpts: NDArray = xp.array(kpoints.monkhorst_pack(config.electron.kpt_grid))
+        self.num_kpts = self.kpts.shape[0]
 
         # Initialize transport axis.
         self.transport_axis = "xyz".index(config.device.transport_direction)
@@ -89,12 +93,23 @@ class Device:
         self._init_contacts()
 
         # TODO: Initialize potential.
-        self.potential = ...
+        pos_axis = self.orbital_positions[:, self.transport_axis]
+        pos_min = pos_axis.min()
+        pos_max = pos_axis.max()
+        Vmin = float(self.config.bias.bias_start)
+        pot_fn = linear_potential(Vmin, pos_min, pos_max)  
+        self.potential = pot_fn(pos_axis)                   
 
         # Mark as configured.
         self._is_configured = True
 
-    def _assemble_interaction_tensor(self) -> NDArray: ...
+    def _assemble_interaction_tensor(self) -> NDArray:
+        
+        prefactor = (-e / 2.0) * (1j / hbar)  
+        # interaction_tensor = oe.contract("kr,rij,rp->kijp", phases_factor, self.hamiltonian_r, R_vec)
+
+        interaction_tensor = prefactor * self.hamiltonian_r[..., np.newaxis] * self.distances  # CPU
+        return interaction_tensor
 
     def _init_contacts(self):
         """Initializes the indices for the contact regions."""
@@ -179,9 +194,8 @@ class Device:
         # # Set diagonal to zero (Do we exclude self-interaction here?)
         # for m in range(D0.shape[0]):
         #     xp.fill_diagonal(D0[m], 0.0)
-
         return D0  # shape (Nw,N,N)
-
+    
     def compute_d0_delta_perp(self, photon_energies):
         
         D0 = self.compute_d0(self, photon_energies)
@@ -227,11 +241,10 @@ class Device:
                     delta_transverse[(i, j)] = sp.csr_matrix(delta_transversal)
             
             
-        num_orbital = self.distances.shape[0]
 
         # stack into dense tensor Delta[i,j,u,v]
         Delta = xp.empty(
-            (num_orbital, num_orbital, 3, 3), dtype=float
+            (self.num_orbitals, self.num_orbitals, 3, 3), dtype=float
         )  # or complex if needed
         for u in range(3):
             for v in range(3):

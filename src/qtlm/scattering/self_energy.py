@@ -34,13 +34,13 @@ class SelfEnergy:
 
         # constants
         self.prefactor = 1j * mu_0 * (1 / (2 * xp.pi))
-        self.dE = xp.diff(self.electron_energies).mean()
-        self.dhw = xp.diff(self.photon_energies).mean()
+        self.dE = xp.abs(self.electron_energies[1] - self.electron_energies[0])
+        self.dhw = xp.abs(self.photon_energies[1] - self.photon_energies[0])
 
     def compute(
         self,
-        g_lesser: NDArray,
-        d_lesser: NDArray,
+        g_electron: NDArray,
+        d_photon: NDArray,
         out: tuple[NDArray, NDArray, NDArray],
     ) -> None:
         """Compute the photon self-energy Σ.
@@ -53,6 +53,7 @@ class SelfEnergy:
         """
 
         # compute self-energy
+        print("Starting FFT based transversal self-energy computation...")
 
         if not xp.allclose(xp.diff(self.electron_energies), self.dE, rtol=1e-6, atol=1e-12):
             raise ValueError("energy_grid should be uniformly spaced for FFT")
@@ -68,12 +69,12 @@ class SelfEnergy:
         n = self.Nw + self.Nw - 1  # padding
         start_ifft_timer = time.perf_counter()
         # FFT: energy/frequency domain to time domain: energy -> tau
-        G_IFFT = scipy.fft.fft(
-            g_lesser, n, axis=0, workers=128
-        )  # (Np, N, N) #TODO: change to the fastest option
-        G_IFFT = xp.flip(G_IFFT, axis=0)  # reverse the order to get G(tau)
+        g_electron_fft = scipy.fft.fft(
+            g_electron, n, axis=0, workers=128
+        )  # (Np, N, N) 
+        g_electron_fft = xp.flip(g_electron_fft, axis=0)  # reverse the order to get G(tau)#TODO: change to the fastest option
         # G_IFFT = xp.conj(G_IFFT[::-1, ...])  # reverse the order to get G(tau)
-        D_IFFT = scipy.fft.fft(d_lesser, n, axis=0, workers=128)  # (Np, N, N)
+        d_photon_fft = scipy.fft.fft(d_photon, n, axis=0, workers=128)  # (Np, N, N)
         end_ifft_timer = time.perf_counter()
         print(
             f"first fourier transform took {end_ifft_timer - start_ifft_timer:.3f}s"
@@ -86,16 +87,16 @@ class SelfEnergy:
             "iju,til,lkv,tjkuv->tjk",  # optimized scaling at 6
             "iju,til,lkv,tjluv->tjk",
         ]
-        SUM = None
+        summation_terms = None
         for i in indices_list:
 
             start = time.perf_counter()
             path, path_info = oe.contract_path(
                 i,
                 device.interaction_tensor,
-                G_IFFT,
+                g_electron_fft,
                 device.interaction_tensor,
-                D_IFFT,
+                d_photon_fft,
                 optimize="optimal",
                 memory_limit="max_input",
             )
@@ -108,25 +109,25 @@ class SelfEnergy:
             Term = oe.contract(
                 i,
                 device.interaction_tensor,
-                G_IFFT,
+                g_electron_fft,
                 device.interaction_tensor,
-                D_IFFT,
+                d_photon_fft,
                 optimize=path,
                 memory_limit="max_input",
             )
             # later passes: mutate in place
-            if SUM is None:
+            if summation_terms is None:
                 # first pass: take a writable copy, do NOT add twice
-                SUM = Term + 0
+                summation_terms = Term + 0
             else:
-                SUM += Term
+                summation_terms += Term
 
             del Term
 
         print("Be patient, FFT back is starting...")
 
         time_FFT_start = time.perf_counter()
-        Sigma_full = xp.fft.ifft(SUM, axis=0)  # (n, N, N, 3, 3)
+        Sigma_full = xp.fft.ifft(summation_terms, axis=0)  # (n, N, N, 3, 3)
         Sigma_full = self.prefactor * Sigma_full
         time_FFT_end = time.perf_counter()
         print(
@@ -143,6 +144,6 @@ class SelfEnergy:
 
         # select only selected electron energies and corresponding polarization values
         sigma_selected = Sigma_full[idx, ...]  # (NE, N, N, 3, 3)
-
+        print("shape of self-energy: ", sigma_selected.shape)
+        print("you made it self-energy runs")
         return sigma_selected
-        # s_greater[...] = -xp.conj(s_lesser.transpose(0, 2, 1, 4, 3)) #fermionic nature
