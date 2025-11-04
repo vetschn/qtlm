@@ -109,6 +109,7 @@ class PhotonConfig(BaseModel):
 
     energy_start: PositiveFloat
     energy_stop: PositiveFloat
+    energy_window_num: PositiveInt | None = None
     energy_step: float | None = None
 
     energy_batch_size: PositiveInt = 128
@@ -123,6 +124,12 @@ class PhotonConfig(BaseModel):
                 "Only one of 'energy_window_num' or 'energy_step' should be set."
             )
 
+        if self.energy_window_num is not None: # ich denke only energy step, sould be fixed make life way easier
+            self.energies = xp.linspace(
+                self.energy_start,
+                self.energy_stop,
+                self.energy_window_num,
+            )
         elif self.energy_step is not None:
             self.energies = xp.arange(
                 self.energy_start,

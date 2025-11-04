@@ -1,7 +1,7 @@
 import time
 import numpy as np
 from ase.dft import kpoints
-
+import einops
 from qtlm import NDArray, linalg, xp
 from qtlm.scattering.device import Device
 from qtlm.config import QTLMConfig 
@@ -20,35 +20,39 @@ class PhotonSolver:
     def _assemble_system_matrix(self, pi_retarded: NDArray):
         """Assembles the system matrix for the electron solver."""
         # phases = xp.einsum("ik,jk->ij", device.kpts[kpt_slice], device.r_vectors)
+        
+        pi_retarde_reshaped = einops.rearrange(
+            pi_retarded,
+            "e m n u v -> e u v m n",
+        )  # (nw, 3, 3, N,N)
 
-        # Pi greater lesser shape (nE, Nk, N, N, 3, 3)
-        # (18,156,156)->(18,156,newaxis,newaxis,newaxis,156) (18,104,104,3,3)->(18,newaxis,104,3,3,104) 
-        # (18,156,156)->(18,156,newaxis,newaxis,newaxis,156) (18,104,104,3,3)->(18,newaxis,104,3,3,104) 
-        # D0 shape: (18, 156, 156)
         D_initial = (device.compute_d0(self.energies))[...,*device.inds_cc]  # (nw, N, N)
 
+        # Assemble system matrix: I-D·D0·Π^R
         self.system_matrix = xp.broadcast_to(
-            xp.eye(3),
-            (self.num_energies, device.num_kpts, device.num_orbitals, device.num_orbitals, 3, 3),
+            xp.eye(3)[None, :, :, None, None],
+            (self.num_energies, 3,3 , device.num_orbitals, device.num_orbitals),
         )
-        -xp.einsum("eij,ejkmn->eikmn", D_initial, pi_retarded) #shape (nW, Nk, N, N, 3, 3)
+        -xp.einsum("eij,emnjk->emnik", D_initial, pi_retarde_reshaped) #shape (nW, 3,3, N, N)
+        print("system matrix shape:", self.system_matrix.shape)
 
     def _compute_obc(self):
         """Computes the open boundary conditions."""
-        d_l = linalg.inv(self.system_matrix[:,:, *device.inds_ll, ...]) #shape (Nw, Nk, Nl, Nl,3,3)
-        print("d_l shape:", d_l.shape)
-        d_r = linalg.inv(self.system_matrix[:,:, *device.inds_rr, ...]) #shape (Nw, Nk, Nr, Nr,3,3)
-        print("d_r shape:", d_r.shape)
+        d_l = linalg.inv(self.system_matrix[..., *device.inds_ll]) 
+        d_r = linalg.inv(self.system_matrix[..., *device.inds_rr]) 
+        print((self.system_matrix[..., *device.inds_cl]).shape)
+        print(d_l.shape)
+        print((self.system_matrix[..., *device.inds_lc]).shape)
 
         pi_retarded_l: NDArray = (
-            self.system_matrix[:, :,*device.inds_cl, :,:]
+            self.system_matrix[...,*device.inds_cl]
             @ d_l
-            @ self.system_matrix[:,:, *device.inds_lc, :,:]
+            @ self.system_matrix[..., *device.inds_lc]
         )
         pi_retarded_r: NDArray = (
-            self.system_matrix[:,:, *device.inds_cr, ...]
+            self.system_matrix[..., *device.inds_cr]
             @ d_r
-            @ self.system_matrix[:,:, *device.inds_rc, ...]
+            @ self.system_matrix[..., *device.inds_rc]
         )
 
         # gamma_r = 1j * (pi_retarded_r - pi_retarded_r.conj().swapaxes(-2, -1))
@@ -75,6 +79,7 @@ class PhotonSolver:
         """Main solver routine."""
         self._assemble_system_matrix((pi_greater - pi_lesser) / 2)
         pi_obc_lesser, pi_obc_greater, pi_obc_retarded = self._compute_obc()
+        #reshape polarization (Nw,3,3,N,N) mit einops
 
         # Solve.
         print("Inverting photon system matrix...")

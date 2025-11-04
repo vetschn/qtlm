@@ -195,7 +195,7 @@ class Device:
         # for m in range(D0.shape[0]):
         #     xp.fill_diagonal(D0[m], 0.0)
         return D0  # shape (Nw,N,N)
-    
+        
     def compute_d0_delta_perp(self, photon_energies):
         
         D0 = self.compute_d0(self, photon_energies)

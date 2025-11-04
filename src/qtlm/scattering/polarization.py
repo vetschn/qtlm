@@ -90,17 +90,18 @@ class Polarization:
 
         print("Starting the big summation over k-points and contraction, BE PATIENT...")    
         start = time.perf_counter()
+        indices_list = [
+            "miu,tmj,jnv,tni->tmnuv",
+            "miu,tmn,njv,tji->tmnuv",
+            "miu,tij,jnv,tnm->tmnuv",
+            "miu,tin,njv,tjm->tmnuv",
+        ]
+            
         summation_terms = None 
-        for k in range(Nk):
-            indices_list = [
-                "miu,tmj,jnv,tni->tmnuv",
-                "miu,tmn,njv,tji->tmnuv",
-                "miu,tij,jnv,tnm->tmnuv",
-                "miu,tin,njv,tjm->tmnuv",
-            ]
-            
-            
-            for i in indices_list:
+        for i in indices_list:
+
+            for k in range(Nk):
+                summation_over_k = None
                 path, path_info = oe.contract_path(
                     i,
                     interaction_tensor[k,:,:,:],
@@ -111,7 +112,7 @@ class Polarization:
                     memory_limit="max_input",
                 )
                 
-                Term = oe.contract(
+                Term_k = oe.contract(
                     i,
                     interaction_tensor[k,:,:,:],
                     g_lesser_fft[:, k, :, :],
@@ -121,12 +122,18 @@ class Polarization:
                     memory_limit="max_input",
                 )  # (n, N, N, 3, 3)
             
-                if summation_terms is None:
-                    summation_terms = Term
+                if summation_over_k is None:
+                    summation_over_k = Term_k
                 else:
-                    summation_terms += Term
+                    summation_over_k += Term_k
+                del Term_k
 
-                del Term
+            if summation_terms is None:
+                    summation_terms = summation_over_k
+            else:
+                summation_terms += summation_over_k
+
+            del summation_over_k
 
         end = time.perf_counter()
         # print(path_info)
@@ -160,7 +167,7 @@ class Polarization:
         pi_lesser = p_polarization_selected
         # --- detailed balance: Π^>(ω) = iΠ^<(-hbarω) ---
         pi_greater = -xp.conj(pi_lesser[::-1])
-
+      \
         print("you made it! poalarization runs")
 
         return pi_lesser, pi_greater
