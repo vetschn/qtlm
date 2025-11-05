@@ -16,6 +16,7 @@ class ElectronSolver:
         self.config = config
         self.energies = config.energies
         self.system_matrix = None
+        
 
         # TODO: bias setting in config
         phi = 0.5
@@ -44,20 +45,41 @@ class ElectronSolver:
         print("Assembling system matrix...")
         time_start = time.perf_counter()
         # Assemble system matrix: M = E - H - Σ^R - V
-        self.system_matrix = (
-            oe.contract(
-                "i,jkl->ijkl",
-                # (self.energies[energy_slice] + 1j * self.config.electron.eta),
-                (self.energies + 1j * self.config.eta),
-                s_k,
-            )
-            - h_k  # shape (441, 156, 156)
-            - sigma_retarded  # now (441, 156, 156) was (625, 156, 156)
-            - potential  # shape (441, 156, 156)
-        )  # shape (300, 441, 156, 156) -> is full
-        time_end = time.perf_counter()
-        print(f"Time to assemble system matrix: {time_end - time_start:.3f} s")
+        if sigma_retarded.shape == h_k.shape:
+            self.system_matrix = (
+                oe.contract(
+                    "i,jkl->ijkl",
+                    # (self.energies[energy_slice] + 1j * self.config.electron.eta),
+                    (self.energies + 1j * self.config.eta),
+                    s_k,
+                )
+                - h_k  # shape (441, 156, 156)
+                - sigma_retarded  # now (441, 156, 156) 
+                - potential  # shape (441, 156, 156)
+            )  # shape (300, 441, 156, 156) -> is full
 
+            print("shape system matrix:", self.system_matrix.shape)
+            time_end = time.perf_counter()
+            print(f"Time to assemble system matrix: {time_end - time_start:.3f} s")
+
+        else:
+            time_start = time.perf_counter()
+            # Assemble system matrix: M = E - H - Σ^R - V
+            self.system_matrix = (
+                (oe.contract(
+                    "i,jkl->ijkl",
+                    (self.energies + 1j * self.config.eta),
+                    s_k[...,*device.inds_cc],
+                )
+                - h_k[...,*device.inds_cc]  # shape (Nk, 156, 156)
+                - potential[...,*device.inds_cc]  # shape (Nk, 156, 156))
+                ) - sigma_retarded  # now (Nw,Nk, Nored, Nored) 
+            )  # shape (Ne, Nk, Notot, Notot) -> is full
+            print("shape system matrix:", self.system_matrix.shape)
+            time_end = time.perf_counter()
+            print(f"Time to assemble system matrix: {time_end - time_start:.3f} s")
+
+#if obc are 
     def _compute_obc(self):
         """Computes the open boundary conditions."""
         g_l = linalg.inv(self.system_matrix[..., *device.inds_ll])  # (300, 441, 26, 26)
@@ -79,13 +101,13 @@ class ElectronSolver:
 
         print("Computing sigma lesser/greater...")
         start_sigma = time.perf_counter()
-        sigma_lesser = xp.einsum(
+        sigma_lesser_obc = xp.einsum(
             "i,ijkl->ijkl", self.occupancies_r, gamma_r
         ) + xp.einsum(
             "i,ijkl->ijkl", self.occupancies_l, gamma_l
         )  # (300, 441, 104, 104)
         # sigma_lesser = (1j * self.occupancies_r * gamma_r + 1j * self.occupancies_l * gamma_l)
-        sigma_greater = oe.contract(
+        sigma_greater_obc = oe.contract(
             "i,ijkl->ijkl", 1 - self.occupancies_r, gamma_r
         ) + xp.einsum(
             "i,ijkl->ijkl", 1 - self.occupancies_l, gamma_l
@@ -94,9 +116,9 @@ class ElectronSolver:
         # sigma_greater = (1j * (1 - self.occupancies_r) * gamma_r + 1j * (1 - self.occupancies_l) * gamma_l)
         print(f"Time to compute sigma lesser/greater: {end_sigma - start_sigma:.3f} s")
 
-        sigma_retarded = sigma_retarded_l + sigma_retarded_r  # (300, 441, 104, 104)
+        sigma_retarded_obc = sigma_retarded_l + sigma_retarded_r  # (300, 441, 104, 104)
 
-        return sigma_lesser, sigma_greater, sigma_retarded
+        return sigma_lesser_obc, sigma_greater_obc, sigma_retarded_obc
 
     def solve(
         self,
@@ -120,17 +142,34 @@ class ElectronSolver:
         time_end = time.perf_counter()
         print(f"Time to invert system matrix: {time_end - time_start:.3f} s")
 
-        # Compute lesser and greater Green's functions.
-        g_lesser = (
-            g_retarded
-            @ (sigma_lesser[..., *device.inds_cc] + sigma_obc_lesser)
-            @ g_retarded.conj().swapaxes(-2, -1)
-        )
-        g_greater = (
-            g_retarded
-            @ (sigma_greater[..., *device.inds_cc] + sigma_obc_greater)
-            @ g_retarded.conj().swapaxes(-2, -1)
-        )
+        # Compute lesser and greater Green's functions
+        
+        if sigma_lesser.shape != sigma_obc_lesser.shape:
+            print("sigma lesser shape:", sigma_lesser.shape, " sigma obc lesser shape:", sigma_obc_lesser.shape)
+            g_lesser = (
+                g_retarded
+                @ (sigma_lesser[..., *device.inds_cc] + sigma_obc_lesser)
+                @ g_retarded.conj().swapaxes(-2, -1)
+            )
+            g_greater = (
+                g_retarded
+                @ (sigma_greater[..., *device.inds_cc] + sigma_obc_greater)
+                @ g_retarded.conj().swapaxes(-2, -1)
+            )
+        
+        else:
+            g_lesser = (
+                g_retarded
+                @ (sigma_lesser+ sigma_obc_lesser)
+                @ g_retarded.conj().swapaxes(-2, -1)
+            )
+            g_greater = (
+                g_retarded
+                @ (sigma_greater+ sigma_obc_greater)
+                @ g_retarded.conj().swapaxes(-2, -1)
+            )
+            prin("g_lesser shape:", g_lesser.shape, " g_greater shape:", g_greater.shape)
+
 
         print("you made it! electron solver runs")
 

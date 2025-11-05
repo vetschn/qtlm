@@ -40,7 +40,7 @@ class SCBA:
             sigma_lesser=xp.zeros((device.num_kpts, device.num_orbitals, device.num_orbitals), dtype=xp.complex128),
             sigma_greater=xp.zeros((device.num_kpts, device.num_orbitals, device.num_orbitals), dtype=xp.complex128),
         )
-
+    #uhm why is sigma lesser and greater looked as a function of the number of k-points if at the end we have the energy. Something is odd????????????
     def _has_converged(self) -> bool:
         return False  # Placeholder for convergence check logic.
 

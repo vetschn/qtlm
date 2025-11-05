@@ -80,7 +80,6 @@ class Polarization:
             f"FFT took {end_fft_timer - start_fft_timer:.3f}s"
         )  # np : 9.933s  | scipy : 9.911s
         
-
         interaction_tensor = (device.interaction_tensor.astype(
             xp.complex128, copy=False
         ))[...,*device.inds_cc,:]  # (Nl,N, N,3)

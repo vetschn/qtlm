@@ -66,11 +66,11 @@ class SelfEnergy:
         d__photon_reshaped = einops.rearrange(d_photon, "e m n u v -> e u v m n")  # (Nw, 3, 3, N,N)
 
         Nw = d_photon.shape[0] 
-        Ne, Nk, _, _ = g_electron.shape
+        Ne, Nk, No, _ = g_electron.shape
         print("d_photon reshaped shape:", d__photon_reshaped.shape, "g_electron shape:", g_electron.shape)
 
 
-        n = Nw + Nw - 1  # padding
+        n = Ne + Ne - 1  # padding
         # FFT: energy/frequency domain to time domain: energy -> tau
         start_ifft_timer = time.perf_counter()
         g_electron_fft = scipy.fft.fft(
@@ -90,6 +90,7 @@ class SelfEnergy:
         ))[...,*device.inds_cc,:]  # (Nl,N, N,3)
 
         # Get the term for the transverse self-energy
+        print("Starting the summation for self-energy...")
         start_einsum_timer = time.perf_counter()
         indices_list = [
             "iju,til,lkv,tikuv->tjk",
@@ -114,7 +115,8 @@ class SelfEnergy:
         summation_terms = None
         
         for i in indices_list:
-            summation_over_k = None
+
+            term_holder = xp.zeros((g_electron_fft.shape[0], Nk, No, No), dtype=xp.complex128)
             for k in range(Nk):
             # start = time.perf_counter()
             # path, path_info = oe.contract_path(
@@ -141,20 +143,17 @@ class SelfEnergy:
                     optimize=path_mem[indices_list.index(i)],
                     memory_limit="max_input",
                 )
-                # later passes: mutate in place
-                if summation_over_k is None:
-                    summation_over_k = Term + 0
-                else:
-                    summation_over_k += Term
 
-                del Term
+                term_holder[:,k,...] = Term  # (Np, N, N)
             
             if summation_terms is None:
-                    summation_terms = summation_over_k
+                    summation_terms = term_holder
             else:
-                summation_terms += summation_over_k
+                summation_terms += term_holder
 
-            del summation_over_k
+            del Term
+
+
         end_einsum_timer = time.perf_counter()
         print(
             f"summation took {end_einsum_timer - start_einsum_timer:.3f}s"
