@@ -43,6 +43,7 @@ class ElectronSolver:
 
         print("Assembling system matrix...")
         time_start = time.perf_counter()
+        # Assemble system matrix: M = E - H - Σ^R - V
         self.system_matrix = (
             oe.contract(
                 "i,jkl->ijkl",

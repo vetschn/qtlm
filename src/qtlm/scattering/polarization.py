@@ -11,6 +11,7 @@ from qtlm.constants import hbar, mu_0
 
 from qtlm.scattering.device import Device
 from qtlm.config import QTLMConfig
+import einops
 
 device = Device()
 
@@ -62,7 +63,7 @@ class Polarization:
                 f"Mismatch in spacing : Δω={self.dhw:.3e} vs ΔEs={self.dE:.3e}"
             )
         
-        Ne, Nk, N, _ = g_lesser.shape
+        Ne, Nk, N, _ = g_lesser.shape 
         n = Ne + Ne - 1  # padding
         print(" The padding for FFT is:", n)
 
@@ -80,13 +81,11 @@ class Polarization:
         )  # np : 9.933s  | scipy : 9.911s
         
 
-        interaction_tensor_ind = (device.interaction_tensor.astype(
+        interaction_tensor = (device.interaction_tensor.astype(
             xp.complex128, copy=False
-        ))[...,*device.inds_cc,:]  # (N, N,3)
-        phases = oe.contract("ik,jk->ij", device.kpts, device.r_vectors)
-        phase_factors = xp.exp(2j * xp.pi * phases)
-        interaction_tensor = oe.contract("ij,jklm->iklm", phase_factors, interaction_tensor_ind)
-        print("Interaction tensor shape:", interaction_tensor.shape)
+        ))[...,*device.inds_cc,:]  # (Nl,N, N,3)
+        # erreur potentielle car interaction tensor N lattice pas k-space
+        print("Interaction tensor shape:", interaction_tensor.shape, "g_lesser_fft shape:", g_lesser_fft.shape, "g_greater_fft shape:", g_greater_fft.shape)
 
         print("Starting the big summation over k-points and contraction, BE PATIENT...")    
         start = time.perf_counter()
@@ -96,29 +95,44 @@ class Polarization:
             "miu,tij,jnv,tnm->tmnuv",
             "miu,tin,njv,tjm->tmnuv",
         ]
-            
+        
+        path_mem = []
+        for i in indices_list:
+            path, path_info = oe.contract_path(
+                i,
+                interaction_tensor[0,:,:,:],
+                g_lesser_fft[:, 0, :, :],
+                interaction_tensor[0,:,:,:],
+                g_greater_fft[:, 0, :, :],
+                optimize="optimal",
+                memory_limit="max_input",
+                )
+            path_mem.append(path)
+        
+             
         summation_terms = None 
         for i in indices_list:
-
+              
             for k in range(Nk):
+
+                #einsum look at it if more efficient
                 summation_over_k = None
-                path, path_info = oe.contract_path(
-                    i,
-                    interaction_tensor[k,:,:,:],
-                    g_lesser_fft[:, k, :, :],
-                    interaction_tensor[k,:,:,:],
-                    g_greater_fft[:, k, :, :],
-                    optimize="optimal",
-                    memory_limit="max_input",
-                )
-                
+                # path, path_info = oe.contract_path(
+                #     i,
+                #     interaction_tensor[k,:,:,:],
+                #     g_lesser_fft[:, k, :, :],
+                #     interaction_tensor[k,:,:,:],
+                #     g_greater_fft[:, k, :, :],
+                #     optimize="optimal",
+                #     memory_limit="max_input",
+                # )
                 Term_k = oe.contract(
                     i,
                     interaction_tensor[k,:,:,:],
                     g_lesser_fft[:, k, :, :],
                     interaction_tensor[k,:,:,:],
                     g_greater_fft[:, k, :, :],
-                    optimize=path,
+                    optimize=path_mem[indices_list.index(i)],
                     memory_limit="max_input",
                 )  # (n, N, N, 3, 3)
             
@@ -164,10 +178,17 @@ class Polarization:
         # select only those frequencies and corresponding polarization values
         p_polarization_selected = Pi_omega_full[idx, ...]  # (Nw, N, N, 3, 3)
 
-        pi_lesser = p_polarization_selected
         # --- detailed balance: Π^>(ω) = iΠ^<(-hbarω) ---
-        pi_greater = -xp.conj(pi_lesser[::-1])
-      \
+        #reshape polarization (Nw,3,3,N,N) mit einops
+
         print("you made it! poalarization runs")
+        pi_lesser = einops.rearrange(
+            p_polarization_selected,
+            "e m n u v -> e u v m n",
+        )  # (nw, 3, 3, N,N)
+
+        pi_greater =  -xp.conj(pi_lesser[::-1]) # -pi(-w)
+
+        print("pi_lesser shape:", pi_lesser.shape," pi_greater shape:", pi_greater.shape)
 
         return pi_lesser, pi_greater

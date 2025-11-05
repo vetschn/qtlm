@@ -2,7 +2,7 @@ import time
 
 import opt_einsum as oe
 import scipy
-
+import einops
 
 from qtlm import NDArray, xp
 from qtlm.scattering.device import Device
@@ -29,8 +29,6 @@ class SelfEnergy:
         # grids
         self.electron_energies = config.electron.energies
         self.photon_energies = config.photon.energies
-        self.Ne = self.electron_energies.size
-        self.Nw = self.photon_energies.size
 
         # constants
         self.prefactor = 1j * mu_0 * (1 / (2 * xp.pi))
@@ -41,13 +39,12 @@ class SelfEnergy:
         self,
         g_electron: NDArray,
         d_photon: NDArray,
-        out: tuple[NDArray, NDArray, NDArray],
     ) -> None:
         """Compute the photon self-energy Σ.
 
         Args:
           g:        (Ne, N, N) complex
-          d:        (N, N) complex
+          d:        (Nw, 3, 3, N, N) complex
           outputs:  tuple of NDArray to store results
                     each of shape (Nw, N, N, 3, 3) complex
         """
@@ -65,64 +62,103 @@ class SelfEnergy:
             raise ValueError(
                 f"Mismatch in spacing : Δω={self.dhw:.3e} vs ΔEs={self.dE:.3e}"
             )
+        
+        d__photon_reshaped = einops.rearrange(d_photon, "e m n u v -> e u v m n")  # (Nw, 3, 3, N,N)
 
-        n = self.Nw + self.Nw - 1  # padding
-        start_ifft_timer = time.perf_counter()
+        Nw = d_photon.shape[0] 
+        Ne, Nk, _, _ = g_electron.shape
+        print("d_photon reshaped shape:", d__photon_reshaped.shape, "g_electron shape:", g_electron.shape)
+
+
+        n = Nw + Nw - 1  # padding
         # FFT: energy/frequency domain to time domain: energy -> tau
+        start_ifft_timer = time.perf_counter()
         g_electron_fft = scipy.fft.fft(
             g_electron, n, axis=0, workers=128
         )  # (Np, N, N) 
         g_electron_fft = xp.flip(g_electron_fft, axis=0)  # reverse the order to get G(tau)#TODO: change to the fastest option
         # G_IFFT = xp.conj(G_IFFT[::-1, ...])  # reverse the order to get G(tau)
-        d_photon_fft = scipy.fft.fft(d_photon, n, axis=0, workers=128)  # (Np, N, N)
+        d_photon_fft = scipy.fft.fft(d__photon_reshaped, n, axis=0, workers=128)  # (Np, N, N)
         end_ifft_timer = time.perf_counter()
+        
         print(
             f"first fourier transform took {end_ifft_timer - start_ifft_timer:.3f}s"
         )  # np : 27.7 sec | scipy : 0.989s
 
+        interaction_tensor = (device.interaction_tensor.astype(
+            xp.complex128, copy=False
+        ))[...,*device.inds_cc,:]  # (Nl,N, N,3)
+
         # Get the term for the transverse self-energy
+        start_einsum_timer = time.perf_counter()
         indices_list = [
             "iju,til,lkv,tikuv->tjk",
             "iju,til,lkv,tiluv->tjk",  # optimized scaling at 6
             "iju,til,lkv,tjkuv->tjk",  # optimized scaling at 6
             "iju,til,lkv,tjluv->tjk",
         ]
-        summation_terms = None
+        path_mem = []
         for i in indices_list:
-
-            start = time.perf_counter()
-            path, path_info = oe.contract_path(
+            path,_ = oe.contract_path(
                 i,
-                device.interaction_tensor,
-                g_electron_fft,
-                device.interaction_tensor,
+                interaction_tensor[0,...],
+                g_electron_fft[:,0,...],
+                interaction_tensor[0,...],
                 d_photon_fft,
                 optimize="optimal",
                 memory_limit="max_input",
             )
-            end = time.perf_counter()
-            print(
-                path_info,
-            )  # optionnel: affiche le plan de contraction
-            print(end - start)
+            path_mem.append(path)
 
-            Term = oe.contract(
-                i,
-                device.interaction_tensor,
-                g_electron_fft,
-                device.interaction_tensor,
-                d_photon_fft,
-                optimize=path,
-                memory_limit="max_input",
-            )
-            # later passes: mutate in place
+        
+        summation_terms = None
+        
+        for i in indices_list:
+            summation_over_k = None
+            for k in range(Nk):
+            # start = time.perf_counter()
+            # path, path_info = oe.contract_path(
+            #     i,
+            #     device.interaction_tensor,
+            #     g_electron_fft,
+            #     device.interaction_tensor,
+            #     d_photon_fft,
+            #     optimize="optimal",
+            #     memory_limit="max_input",
+            # )
+            # end = time.perf_counter()
+            # print(
+            #     path_info,
+            # )  # optionnel: affiche le plan de contraction
+            # print(end - start)
+
+                Term = oe.contract(
+                    i,
+                    interaction_tensor[k,...],
+                    g_electron_fft[:,k,...],
+                    interaction_tensor[k,...],
+                    d_photon_fft,
+                    optimize=path_mem[indices_list.index(i)],
+                    memory_limit="max_input",
+                )
+                # later passes: mutate in place
+                if summation_over_k is None:
+                    summation_over_k = Term + 0
+                else:
+                    summation_over_k += Term
+
+                del Term
+            
             if summation_terms is None:
-                # first pass: take a writable copy, do NOT add twice
-                summation_terms = Term + 0
+                    summation_terms = summation_over_k
             else:
-                summation_terms += Term
+                summation_terms += summation_over_k
 
-            del Term
+            del summation_over_k
+        end_einsum_timer = time.perf_counter()
+        print(
+            f"summation took {end_einsum_timer - start_einsum_timer:.3f}s"
+        )  # np : 583s | scipy : 5.34s
 
         print("Be patient, FFT back is starting...")
 
@@ -137,13 +173,19 @@ class SelfEnergy:
         # index array
         idx = xp.round((self.electron_energies - self.electron_energies[0]) / self.dhw).astype(int)
 
-        if xp.any((idx < 0) | (idx >= Sigma_full.shape[0])):
+        if xp.any((idx < 0) ):
 
-            bad = self.photon_energies[(idx < 0) | (idx >= Sigma_full.shape[0])]
+            bad = self.photon_energies[(idx < 0) | (idx > Sigma_full.shape[0])] #| (idx >= Sigma_full.shape[0])
             raise ValueError(f"Some requeste energies fall outside the FFT grid: {bad}")
+        
+        elif xp.any(idx>Sigma_full.shape[0]):
+            sigma_selected = Sigma_full
+        
+        else:
+            sigma_selected = Sigma_full[idx, ...]  # (NE, N, N, 3, 3)
 
         # select only selected electron energies and corresponding polarization values
-        sigma_selected = Sigma_full[idx, ...]  # (NE, N, N, 3, 3)
         print("shape of self-energy: ", sigma_selected.shape)
         print("you made it self-energy runs")
+
         return sigma_selected
