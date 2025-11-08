@@ -30,26 +30,38 @@ class SCBA:
     def __init__(self, config):
 
         self.max_iterations = 100
-        self.electron_solver = ElectronSolver(config.electron)
-        self.photon_solver = PhotonSolver(config)
+        self.electron_solver = ElectronSolver(config)
         self.polarization = Polarization(config)
+        self.photon_solver = PhotonSolver(config)
         self.self_energy = SelfEnergy(config)
 
         self.data = SCBAData(
             sigma_lesser=xp.zeros(
-                (device.num_kpts, device.num_orbitals, device.num_orbitals),
+                (
+                    config.electron.energies.size,
+                    device.num_kpts,
+                    device.inds_cc[0].stop - device.inds_cc[0].start,
+                    device.inds_cc[1].stop - device.inds_cc[1].start,
+                ),
                 dtype=xp.complex128,
             ),
             sigma_greater=xp.zeros(
-                (device.num_kpts, device.num_orbitals, device.num_orbitals),
+                (
+                    config.electron.energies.size,
+                    device.num_kpts,
+                    device.inds_cc[0].stop - device.inds_cc[0].start,
+                    device.inds_cc[1].stop - device.inds_cc[1].start,
+                ),
                 dtype=xp.complex128,
             ),
         )
 
     def _has_converged(self) -> bool:
+        """Checks for convergence of the SCBA loop."""
         return False  # Placeholder for convergence check logic.
 
     def run(self):
+        """Runs the SCBA calculation."""
         for i in range(self.max_iterations):
             print(f"SCBA iteration {i+1} -----------------------------")
             self.data.g_lesser, self.data.g_greater = self.electron_solver.solve(

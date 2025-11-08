@@ -5,7 +5,7 @@ import opt_einsum as oe
 from ase.dft import kpoints
 
 from qtlm import NDArray, linalg, xp
-from qtlm.config import BiasConfig, ElectronConfig
+from qtlm.config import QTLMConfig
 from qtlm.scattering.device import Device
 from qtlm.statistics import fermi_dirac
 
@@ -14,9 +14,9 @@ device = Device()
 
 class ElectronSolver:
 
-    def __init__(self, config: ElectronConfig):
+    def __init__(self, config: QTLMConfig):
         self.config = config
-        self.energies = config.energies
+        self.energies = config.electron.energies
         self.system_matrix = None
 
         # TODO: bias setting in config
@@ -24,17 +24,17 @@ class ElectronSolver:
         # phi : bias pints (it s an array we will run the program for all of them)
         # Left contact has the potential drop.
         self.occupancies_l = fermi_dirac(
-            self.energies - config.fermi_level, config.temperature
+            self.energies - config.electron.fermi_level - phi,
+            config.electron.temperature,
         )
         self.occupancies_r = fermi_dirac(
-            self.energies - config.fermi_level, config.temperature
+            self.energies - config.electron.fermi_level, config.electron.temperature
         )
 
     def _assemble_system_matrix(self, sigma_retarded: NDArray):
         """Assembles the system matrix for the electron solver."""
 
         # k-space transformation of hamiltonian, overlap, and sigma_retarded
-        # phases = xp.einsum("ik,jk->ij", device.kpts[kpt_slice], device.r_vectors)
         phases = oe.contract("ik,jk->ij", device.kpts, device.r_vectors)
         phase_factors = xp.exp(2j * xp.pi * phases)
         h_k = oe.contract("ij,jkl->ikl", phase_factors, device.hamiltonian_r)
@@ -50,7 +50,7 @@ class ElectronSolver:
             oe.contract(
                 "i,jkl->ijkl",
                 # (self.energies[energy_slice] + 1j * self.config.electron.eta),
-                (self.energies + 1j * self.config.eta),
+                (self.energies + 1j * self.config.electron.eta),
                 s_k,
             )
             - h_k  # shape (441, 156, 156)
@@ -106,31 +106,40 @@ class ElectronSolver:
         sigma_greater: NDArray,
     ):
         """Main solver routine."""
-        self._assemble_system_matrix(
-            (sigma_greater - sigma_lesser) / 2
-        )  # (625->441 (because k-space), 156 ->104 (because of boundary conditons?), 156->104)
-        sigma_obc_lesser, sigma_obc_greater, sigma_obc_retarded = (
-            self._compute_obc()
-        )  # dimenesions (300, 441, 104, 104)
+        # (625->441 (because k-space), 156 ->104 (because of boundary conditons?), 156->104)
+        sigma_retarded = np.zeros(
+            (
+                self.energies.size,
+                device.num_kpts,
+                device.num_orbitals,
+                device.num_orbitals,
+            ),
+            dtype=xp.complex128,
+        )
+        sigma_retarded[..., *device.inds_cc] = (sigma_greater - sigma_lesser) / 2
+        self._assemble_system_matrix(sigma_retarded)
+        # dimenesions (300, 441, 104, 104)
+        sigma_obc_lesser, sigma_obc_greater, sigma_obc_retarded = self._compute_obc()
 
         # Solve.
         print("Inverting system matrix to get g_retarded...")
         time_start = time.perf_counter()
+        # (300, 441, 104, 104) put some indice, so shape match, maybe for conscitency and logic there is a better one
         g_retarded = linalg.inv(
             self.system_matrix[..., *device.inds_cc] - sigma_obc_retarded
-        )  # (300, 441, 104, 104) put some indice, so shape match, maybe for conscitency and logic there is a better one
+        )
         time_end = time.perf_counter()
         print(f"Time to invert system matrix: {time_end - time_start:.3f} s")
 
         # Compute lesser and greater Green's functions.
         g_lesser = (
             g_retarded
-            @ (sigma_lesser[..., *device.inds_cc] + sigma_obc_lesser)
+            @ (sigma_lesser + sigma_obc_lesser)
             @ g_retarded.conj().swapaxes(-2, -1)
         )
         g_greater = (
             g_retarded
-            @ (sigma_greater[..., *device.inds_cc] + sigma_obc_greater)
+            @ (sigma_greater + sigma_obc_greater)
             @ g_retarded.conj().swapaxes(-2, -1)
         )
 

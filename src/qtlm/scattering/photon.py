@@ -196,6 +196,7 @@ class PhotonSolver:
             d_retarded.conj().swapaxes(-2, -1).shape,
         )
         # photon lesser/greater Green's functions
+        # TODO: Include the delta_perp terms here
         d_lesser = d_retarded @ (pi_lesser) @ d_retarded.conj().swapaxes(-2, -1)
         d_greater = d_retarded @ (pi_greater) @ d_retarded.conj().swapaxes(-2, -1)
         print("you made it! Photon Green's functions computed.")

@@ -32,19 +32,6 @@ class Polarization:
         self.dE = xp.abs(self.electron_energies[1] - self.electron_energies[0])
         self.dhw = xp.abs(self.photon_energies[1] - self.photon_energies[0])
 
-    def compute(self, g_lesser: NDArray, g_greater: NDArray) -> None:
-        """
-        Compute Π^(ω) using FFTs to turn the energy convolution into a time product.
-
-        G1:          (nE, N, N) complex
-        G2:          (nE, N, N) complex
-
-        Returns:
-        p_polarization:         (Np, N, N, 3, 3) complex
-        """
-
-        print("Starting FFT based transversal polarization computation...")
-
         if not xp.allclose(
             xp.diff(self.electron_energies), self.dE, rtol=1e-6, atol=1e-12
         ):
@@ -60,37 +47,42 @@ class Polarization:
                 f"Mismatch in spacing : Δω={self.dhw:.3e} vs ΔEs={self.dE:.3e}"
             )
 
+    def compute(self, g_lesser: NDArray, g_greater: NDArray) -> None:
+        """
+        Compute Π^(ω) using FFTs to turn the energy convolution into a time product.
+
+        G1:          (nE, N, N) complex
+        G2:          (nE, N, N) complex
+
+        Returns:
+        p_polarization:         (Np, N, N, 3, 3) complex
+        """
+
+        print("Starting FFT based transversal polarization computation...")
+
         Ne, Nk, N, _ = g_lesser.shape
         n = Ne + Ne - 1  # padding
         print(" The padding for FFT is:", n)
 
         print("Starting FFT forward...")
         start_fft_timer = time.perf_counter()
-        g_lesser_fft = scipy.fft.fft(
-            g_lesser, n, axis=0, workers=128
-        )  # (Np,k-space, N, N)
-        g_greater_fft = scipy.fft.fft(
-            g_greater, n, axis=0, workers=128
-        )  # (Np,-kspace, N, N) 32 sec
+        # (Np,k-space, N, N)
+        g_lesser_fft = scipy.fft.fft(g_lesser, n, axis=0, workers=128)
+        # (Np,-kspace, N, N) 32 sec
+        g_greater_fft = scipy.fft.fft(g_greater, n, axis=0, workers=128)
         end_fft_timer = time.perf_counter()
-        print(
-            f"FFT took {end_fft_timer - start_fft_timer:.3f}s"
-        )  # np : 9.933s  | scipy : 9.911s
 
+        # np : 9.933s  | scipy : 9.911s
+        print(f"FFT took {end_fft_timer - start_fft_timer:.3f}s")
+
+        # (Nl,N, N,3)
         interaction_tensor = (
-            device.interaction_tensor.astype(xp.complex128, copy=False)
-        )[
-            ..., *device.inds_cc, :
-        ]  # (Nl,N, N,3)
+            device.interaction_tensor_k.astype(xp.complex128, copy=False)
+        )[..., *device.inds_cc, :]
         # erreur potentielle car interaction tensor N lattice pas k-space
-        print(
-            "Interaction tensor shape:",
-            interaction_tensor.shape,
-            "g_lesser_fft shape:",
-            g_lesser_fft.shape,
-            "g_greater_fft shape:",
-            g_greater_fft.shape,
-        )
+        print("Interaction tensor shape:", interaction_tensor.shape)
+        print("g_lesser_fft shape:", g_lesser_fft.shape)
+        print("g_greater_fft shape:", g_greater_fft.shape)
 
         print("Starting the big summation over k-points and contraction, BE PATIENT...")
         start = time.perf_counter()

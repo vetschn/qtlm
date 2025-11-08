@@ -32,6 +32,21 @@ class SelfEnergy:
         self.dE = xp.abs(self.electron_energies[1] - self.electron_energies[0])
         self.dhw = xp.abs(self.photon_energies[1] - self.photon_energies[0])
 
+        if not xp.allclose(
+            xp.diff(self.electron_energies), self.dE, rtol=1e-6, atol=1e-12
+        ):
+            raise ValueError("energy_grid should be uniformly spaced for FFT")
+
+        if not xp.allclose(
+            xp.diff(self.electron_energies), self.dhw, rtol=1e-6, atol=1e-12
+        ):
+            raise ValueError("photon_energy should be uniformly spaced for FFT")
+
+        if not xp.isclose(self.dhw, self.dE):
+            raise ValueError(
+                f"Mismatch in spacing : Δω={self.dhw:.3e} vs ΔEs={self.dE:.3e}"
+            )
+
     def compute(
         self,
         g_electron: NDArray,
@@ -49,21 +64,6 @@ class SelfEnergy:
         # compute self-energy
         print("Starting FFT based transversal self-energy computation...")
 
-        if not xp.allclose(
-            xp.diff(self.electron_energies), self.dE, rtol=1e-6, atol=1e-12
-        ):
-            raise ValueError("energy_grid should be uniformly spaced for FFT")
-
-        if not xp.allclose(
-            xp.diff(self.electron_energies), self.dhw, rtol=1e-6, atol=1e-12
-        ):
-            raise ValueError("photon_energy should be uniformly spaced for FFT")
-
-        if not xp.isclose(self.dhw, self.dE):
-            raise ValueError(
-                f"Mismatch in spacing : Δω={self.dhw:.3e} vs ΔEs={self.dE:.3e}"
-            )
-
         d__photon_reshaped = einops.rearrange(
             d_photon, "e m n u v -> e u v m n"
         )  # (Nw, 3, 3, N,N)
@@ -77,28 +77,25 @@ class SelfEnergy:
             g_electron.shape,
         )
 
-        n = Nw + Nw - 1  # padding
+        n = Nw + Ne - 1  # padding
         # FFT: energy/frequency domain to time domain: energy -> tau
         start_ifft_timer = time.perf_counter()
         g_electron_fft = scipy.fft.fft(g_electron, n, axis=0, workers=128)  # (Np, N, N)
-        g_electron_fft = xp.flip(
-            g_electron_fft, axis=0
-        )  # reverse the order to get G(tau)#TODO: change to the fastest option
+        # reverse the order to get G(tau)#TODO: change to the fastest option
+        g_electron_fft = xp.flip(g_electron_fft, axis=0)
         # G_IFFT = xp.conj(G_IFFT[::-1, ...])  # reverse the order to get G(tau)
-        d_photon_fft = scipy.fft.fft(
-            d__photon_reshaped, n, axis=0, workers=128
-        )  # (Np, N, N)
+        # (Np, N, N)
+        d_photon_fft = scipy.fft.fft(d__photon_reshaped, n, axis=0, workers=128)
         end_ifft_timer = time.perf_counter()
 
         print(
             f"first fourier transform took {end_ifft_timer - start_ifft_timer:.3f}s"
         )  # np : 27.7 sec | scipy : 0.989s
 
+        # (Nl,N, N,3)
         interaction_tensor = (
-            device.interaction_tensor.astype(xp.complex128, copy=False)
-        )[
-            ..., *device.inds_cc, :
-        ]  # (Nl,N, N,3)
+            device.interaction_tensor_k.astype(xp.complex128, copy=False)
+        )[..., *device.inds_cc, :]
 
         # Get the term for the transverse self-energy
         start_einsum_timer = time.perf_counter()
@@ -121,10 +118,11 @@ class SelfEnergy:
             )
             path_mem.append(path)
 
-        summation_terms = None
+        # summation_terms = None
 
+        Sigma_full_fft = xp.zeros_like(g_electron_fft)
         for i in indices_list:
-            summation_over_k = None
+            # summation_over_k = None
             for k in range(Nk):
                 # start = time.perf_counter()
                 # path, path_info = oe.contract_path(
@@ -142,7 +140,7 @@ class SelfEnergy:
                 # )  # optionnel: affiche le plan de contraction
                 # print(end - start)
 
-                Term = oe.contract(
+                Sigma_full_fft[:, k] = oe.contract(
                     i,
                     interaction_tensor[k, ...],
                     g_electron_fft[:, k, ...],
@@ -151,20 +149,20 @@ class SelfEnergy:
                     optimize=path_mem[indices_list.index(i)],
                     memory_limit="max_input",
                 )
-                # later passes: mutate in place
-                if summation_over_k is None:
-                    summation_over_k = Term + 0
-                else:
-                    summation_over_k += Term
+                # # later passes: mutate in place
+                # if summation_over_k is None:
+                #     summation_over_k = Term + 0
+                # else:
+                #     summation_over_k += Term
 
-                del Term
+                # del Term
 
-            if summation_terms is None:
-                summation_terms = summation_over_k
-            else:
-                summation_terms += summation_over_k
+            # if summation_terms is None:
+            #     summation_terms = summation_over_k
+            # else:
+            #     summation_terms += summation_over_k
 
-            del summation_over_k
+            # del summation_over_k
         end_einsum_timer = time.perf_counter()
         print(
             f"summation took {end_einsum_timer - start_einsum_timer:.3f}s"
@@ -172,14 +170,17 @@ class SelfEnergy:
 
         print("Be patient, FFT back is starting...")
 
+        print(f"{Sigma_full_fft.shape=}")
+
         time_FFT_start = time.perf_counter()
-        Sigma_full = xp.fft.ifft(summation_terms, axis=0)  # (n, N, N, 3, 3)
+        Sigma_full = xp.fft.ifft(Sigma_full_fft, axis=0)  # (n, N, N, 3, 3)
         Sigma_full = self.prefactor * Sigma_full
         time_FFT_end = time.perf_counter()
         print(
             f"back fourier transform took {time_FFT_end - time_FFT_start:.3f}s"
         )  # in np : 0.583s | scipy : 0.149s
 
+        print(f"{Sigma_full.shape=}")
         # index array
         idx = xp.round(
             (self.electron_energies - self.electron_energies[0]) / self.dhw

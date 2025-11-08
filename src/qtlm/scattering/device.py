@@ -6,6 +6,7 @@ import scipy.sparse as sp
 from ase.dft import kpoints
 
 from qtlm import NDArray, xp
+from qtlm.config import QTLMConfig
 from qtlm.constants import c_0, e, hbar
 from qtlm.io import read_tight_binding_data
 
@@ -52,7 +53,7 @@ class Device:
 
         return cls._instance
 
-    def configure(self, config):
+    def configure(self, config: QTLMConfig):
         """Configures the device by loading tight-binding data."""
         if self._is_configured:
             raise RuntimeError("Device is already configured.")
@@ -68,29 +69,21 @@ class Device:
         atom_positions = atoms.get_positions()
         atom_types = atoms.get_chemical_symbols()
         self.lattice_vectors = atoms.get_cell()
-        # Initialize orbital positions.
-        # atom_positions = np.loadtxt(
-        #     config.input_dir / "device.xyz",
-        #     dtype=float,
-        #     skiprows=2,
-        #     usecols=(1, 2, 3),
-        # )
-        # atom_types = np.loadtxt(
-        #     config.input_dir / "device.xyz", dtype=str, skiprows=2, usecols=0
-        # )
-        repeats = np.vectorize(config.device.num_orbitals_per_atom.get)(atom_types)
-        self.orbital_positions = np.repeat(atom_positions, repeats, axis=0)
-
-        self.num_orbitals = self.orbital_positions.shape[0]
-        # Precompute distances.
-        # self.distances = np.linalg.norm(self.orbital_positions, axis=1)
-
-        # Precompute interaction tensor.
-        self.interaction_tensor = self._assemble_interaction_tensor()
 
         # Precompute k-points.
         self.kpts: NDArray = xp.array(kpoints.monkhorst_pack(config.electron.kpt_grid))
         self.num_kpts = self.kpts.shape[0]
+
+        repeats = np.vectorize(config.device.num_orbitals_per_atom.get)(atom_types)
+        self.orbital_positions = np.repeat(atom_positions, repeats, axis=0)
+
+        self.num_orbitals = self.orbital_positions.shape[0]
+
+        # NOTE: We don't REALLY need to store all distances in memory.
+        # Could just be the norms.
+        self.distances_r = self._compute_distances()  # (Nlattice,N,N,3)
+
+        self.interaction_tensor_k = self._assemble_interaction_tensor_k()
 
         # Initialize transport axis.
         self.transport_axis = "xyz".index(config.device.transport_direction)
@@ -102,6 +95,7 @@ class Device:
         pos_axis = self.orbital_positions[:, self.transport_axis]
         pos_min = pos_axis.min()
         pos_max = pos_axis.max()
+
         Vmin = float(self.config.bias.bias_start)
         pot_fn = linear_potential(Vmin, pos_min, pos_max)
         self.potential = pot_fn(pos_axis)
@@ -109,33 +103,35 @@ class Device:
         # Mark as configured.
         self._is_configured = True
 
-    def distance(self) -> NDArray:
+    def _compute_distances(self) -> NDArray:
         """Returns the distance matrix between orbitals."""
-
-        # self.lattice, self_r_vectors,
-        distances_r = np.zeros(
+        distances = np.zeros(
             (self.r_vectors.shape[0], self.num_orbitals, self.num_orbitals, 3)
-        )  # (num_images, N, N, 3)
+        )
 
-        for i, vec in enumerate(self.r_vectors):
-            image_position = (
-                self.orbital_positions + vec @ self.lattice_vectors
-            )  # (N, N, 3)
-            distances_r[i] = (
+        for i, r_vector in enumerate(self.r_vectors):
+            image_position = self.orbital_positions + r_vector @ self.lattice_vectors
+            distances[i] = (
                 self.orbital_positions[:, np.newaxis] - image_position[np.newaxis, :]
-            )  # (Nlattice,N, N, 3)
+            )
 
-        return distances_r
+        return distances
 
-    def _assemble_interaction_tensor(self) -> NDArray:
+    def _assemble_interaction_tensor_k(self) -> NDArray:
 
         prefactor = (-e / 2.0) * (1j / hbar)
         # interaction_tensor = oe.contract("kr,rij,rp->kijp", phases_factor, self.hamiltonian_r, R_vec)
-        distance_r = self.distance()  # (Nlattice,N,N,3)
-        interaction_tensor = (
-            prefactor * self.hamiltonian_r[..., np.newaxis] * distance_r
+        interaction_tensor_r = (
+            prefactor * self.hamiltonian_r[..., np.newaxis] * self.distances_r
         )  # CPU
-        return interaction_tensor  # Nlattice,N, N,3
+        phases = oe.contract("ik,jk->ij", self.kpts, self.r_vectors)
+        phase_factors = xp.exp(2j * xp.pi * phases)
+        print(f"{interaction_tensor_r.shape=}")
+        interaction_tensor_k = oe.contract(
+            "ij,jklm->iklm", phase_factors, interaction_tensor_r
+        )
+
+        return interaction_tensor_k  # Nlattice,N, N,3
 
     def _init_contacts(self):
         """Initializes the indices for the contact regions."""
@@ -211,8 +207,7 @@ class Device:
         k = omega / c_0
 
         # Now there is the periodicity to consider, introduced via the distance_r
-        distance_r = self.distance()  # (Nlattice,N,N,3) is periodic
-        r = xp.linalg.norm(distance_r, axis=-1)  # (Nlattice, N, N, 3)
+        r = xp.linalg.norm(self.distances_r, axis=-1)  # (Nlattice, N, N, 3)
         r_norm = r.copy()
 
         # for i in range(r.shape[0]):   # loop over lattice images
@@ -241,11 +236,11 @@ class Device:
         D0 = self.compute_d0(photon_energies)
         sigma = 1e-10
         tol = 0.0
-        N = self.distances.shape[0]
+        N = self.distances_r.shape[0]
         pref = 1.0 / (4.0 * xp.pi)
 
         # self.distances
-        r_mn_2 = xp.sum(self.distances**2, axis=2)
+        r_mn_2 = xp.sum(self.distances_r**2, axis=2)
         r_mn = xp.sqrt(r_mn_2)
 
         mark = r_mn > 0
@@ -260,9 +255,9 @@ class Device:
 
         delta_transverse = {}
         for i in range(3):
-            ri = self.distances[..., i]  # (N,N)
+            ri = self.distances_r[..., i]  # (N,N)
             for j in range(3):
-                rj = self.distances[..., j]
+                rj = self.distances_r[..., j]
                 delta_ij = 1.0 if i == j else 0.0
 
                 # δ⊥_{ij}} = δ_ab δ^{(3)}(r)  +  pref * [ 3 r_a r_b / r^5  - δ_ab * r^2 / r^5 ]
