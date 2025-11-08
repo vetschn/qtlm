@@ -3,6 +3,7 @@ import tomllib
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -15,7 +16,6 @@ from pydantic import (
 from typing_extensions import Self
 
 from qtlm import xp
-import numpy as np
 
 _default_num_orbitals_per_atom = {
     "C": 13,
@@ -102,6 +102,7 @@ class ElectronConfig(BaseModel):
         self.kpt_grid = tuple(self.kpt_grid)
         return self
 
+
 class PhotonConfig(BaseModel):
     """Options for the photon subsystem solver."""
 
@@ -124,7 +125,9 @@ class PhotonConfig(BaseModel):
                 "Only one of 'energy_window_num' or 'energy_step' should be set."
             )
 
-        if self.energy_window_num is not None: # ich denke only energy step, sould be fixed make life way easier
+        if (
+            self.energy_window_num is not None
+        ):  # ich denke only energy step, sould be fixed make life way easier
             self.energies = xp.linspace(
                 self.energy_start,
                 self.energy_stop,
@@ -139,7 +142,7 @@ class PhotonConfig(BaseModel):
 
         return self
 
-   
+
 class GrapheneCapacitorConfig(BaseModel):
     """Options for the capacitor model."""
 
@@ -165,7 +168,7 @@ class DeviceConfig(BaseModel):
         default_factory=lambda: _default_num_orbitals_per_atom
     )
 
-    capacitor_model : Literal["none", "graphene"] = "none"
+    capacitor_model: Literal["none", "graphene"] = "none"
     graphene_capacitor: GrapheneCapacitorConfig = GrapheneCapacitorConfig()
 
     @model_validator(mode="after")

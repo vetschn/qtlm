@@ -1,17 +1,17 @@
 import time
 
-from ase.dft import kpoints
 import numpy as np
+from ase.dft import kpoints
 from mpi4py.MPI import COMM_WORLD as comm
 from mpi4py.util import pkl5
 
-from qtlm import NDArray, xp, linalg
-from qtlm.config import QTLMConfig
-from qtlm.io import read_tight_binding_data
-from qtlm.gpu import free_mempool
-from qtlm.statistics import fermi_dirac
+from qtlm import NDArray, linalg, xp
 from qtlm.capacitor import compute_capacitor_potentials
+from qtlm.config import QTLMConfig
 from qtlm.constants import epsilon_0
+from qtlm.gpu import free_mempool
+from qtlm.io import read_tight_binding_data
+from qtlm.statistics import fermi_dirac
 
 if xp.__name__ == "cupy":
     import cupyx as cpx
@@ -465,7 +465,7 @@ class TransportSolver:
             # Use the capacitor model to compute the chemical potentials.
             mu_l, mu_r, phi = self.compute_potentials(bias_point)
             mu_l = mu_l + self.fermi_level - phi
-            mu_r = mu_r + self.fermi_level # r is top and grounded.
+            mu_r = mu_r + self.fermi_level  # r is top and grounded.
 
             self.mu_ls[i] = mu_l
             self.mu_rs[i] = mu_r

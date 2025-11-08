@@ -1,4 +1,4 @@
-from qtlm import NDArray, xp, linalg
+from qtlm import NDArray, linalg, xp
 
 
 def sancho_rubio(

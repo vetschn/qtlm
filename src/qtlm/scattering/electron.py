@@ -1,9 +1,11 @@
-import numpy as np
-from ase.dft import kpoints
-import opt_einsum as oe
 import time
+
+import numpy as np
+import opt_einsum as oe
+from ase.dft import kpoints
+
 from qtlm import NDArray, linalg, xp
-from qtlm.config import ElectronConfig, BiasConfig
+from qtlm.config import BiasConfig, ElectronConfig
 from qtlm.scattering.device import Device
 from qtlm.statistics import fermi_dirac
 
