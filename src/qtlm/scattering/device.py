@@ -8,6 +8,7 @@ from qtlm.constants import hbar, c_0, e
 import einops
 import ase.io
 
+
 def linear_potential(v_at_pos_min: float, pos_min: float, pos_max: float) -> callable:
     """Creates a linear potential drop between two planes.
 
@@ -66,29 +67,21 @@ class Device:
         atom_positions = atoms.get_positions()
         atom_types = atoms.get_chemical_symbols()
         self.lattice_vectors = atoms.get_cell()
-        # Initialize orbital positions.
-        # atom_positions = np.loadtxt(
-        #     config.input_dir / "device.xyz",
-        #     dtype=float,
-        #     skiprows=2,
-        #     usecols=(1, 2, 3),
-        # )
-        # atom_types = np.loadtxt(
-        #     config.input_dir / "device.xyz", dtype=str, skiprows=2, usecols=0
-        # )
-        repeats = np.vectorize(config.device.num_orbitals_per_atom.get)(atom_types)
-        self.orbital_positions = np.repeat(atom_positions, repeats, axis=0)
-
-        self.num_orbitals = self.orbital_positions.shape[0]
-        # Precompute distances.
-        #self.distances = np.linalg.norm(self.orbital_positions, axis=1)
-
-        # Precompute interaction tensor.
-        self.interaction_tensor = self._assemble_interaction_tensor()
 
         # Precompute k-points.
         self.kpts: NDArray = xp.array(kpoints.monkhorst_pack(config.electron.kpt_grid))
         self.num_kpts = self.kpts.shape[0]
+
+        repeats = np.vectorize(config.device.num_orbitals_per_atom.get)(atom_types)
+        self.orbital_positions = np.repeat(atom_positions, repeats, axis=0)
+
+        self.num_orbitals = self.orbital_positions.shape[0]
+
+        # NOTE: We don't REALLY need to store all distances in memory.
+        # Could just be the norms.
+        self.distances_r = self._compute_distances()  # (Nlattice,N,N,3)
+        # Precompute interaction tensor.
+        self.interaction_tensor_k = self._assemble_interaction_tensor_k()
 
         # Initialize transport axis.
         self.transport_axis = "xyz".index(config.device.transport_direction)
@@ -101,32 +94,44 @@ class Device:
         pos_min = pos_axis.min()
         pos_max = pos_axis.max()
         Vmin = float(self.config.bias.bias_start)
-        pot_fn = linear_potential(Vmin, pos_min, pos_max)  
-        self.potential = pot_fn(pos_axis)                   
+        pot_fn = linear_potential(Vmin, pos_min, pos_max)
+        self.potential = pot_fn(pos_axis)
 
         # Mark as configured.
         self._is_configured = True
 
-
-    def distance(self)->NDArray:
+    def _compute_distances(self) -> NDArray:
         """Returns the distance matrix between orbitals."""
-        
-        #self.lattice, self_r_vectors,
-        distances_r = np.zeros((self.r_vectors.shape[0], self.num_orbitals, self.num_orbitals, 3))  #(num_images, N, N, 3)
-        
-        for i,vec in enumerate(self.r_vectors):
-            image_position = self.orbital_positions + vec @ self.lattice_vectors  # (N, N, 3)
-            distances_r[i] = self.orbital_positions[:, np.newaxis] - image_position[np.newaxis, :]  # (Nlattice,N, N, 3)
-        
+
+        # self.lattice, self_r_vectors,
+        distances_r = np.zeros(
+            (self.r_vectors.shape[0], self.num_orbitals, self.num_orbitals, 3)
+        )  # (num_images, N, N, 3)
+
+        for i, vec in enumerate(self.r_vectors):
+            image_position = (
+                self.orbital_positions + vec @ self.lattice_vectors
+            )  # (N, N, 3)
+            distances_r[i] = (
+                self.orbital_positions[:, np.newaxis] - image_position[np.newaxis, :]
+            )  # (Nlattice,N, N, 3)
+
         return distances_r
-    
-    def _assemble_interaction_tensor(self) -> NDArray:
-        
-        prefactor = (-e / 2.0) * (1j / hbar)  
-        # interaction_tensor = oe.contract("kr,rij,rp->kijp", phases_factor, self.hamiltonian_r, R_vec)
-        distance_r = self.distance()  # (Nlattice,N,N,3)            
-        interaction_tensor = prefactor * self.hamiltonian_r[..., np.newaxis] * distance_r  # CPU
-        return interaction_tensor #Nlattice,N, N,3
+
+    def _assemble_interaction_tensor_k(self) -> NDArray:
+
+        prefactor = (-e / 2.0) * (1j / hbar)
+        interaction_tensor_r = (
+            prefactor * self.hamiltonian_r[..., np.newaxis] * self.distances_r
+        )  # CPU
+        # transform to k-space
+        phases = oe.contract("ik,jk->ij", self.kpts, self.r_vectors)
+        phase_factors = xp.exp(2j * xp.pi * phases)
+        interaction_tensor_k = oe.contract(
+            "ij,jklm->iklm", phase_factors, interaction_tensor_r
+        )  # (Nk,N,N,3)
+
+        return interaction_tensor_k  # Nlattice,N, N,3
 
     def _init_contacts(self):
         """Initializes the indices for the contact regions."""
@@ -191,8 +196,7 @@ class Device:
             self.inds_rc = np.ix_(self.inds_r, self.inds_c)
             self.inds_cc = np.ix_(self.inds_c, self.inds_c)
 
-
-    def compute_d0(self,photon_energies):
+    def compute_d0(self, photon_energies):
         """
         3D tensor D0[m, i, j] of Initial Photon Green's functions between each pair (n,m) of positions
         R_positions : (N,3) array of positions of orbitals
@@ -202,40 +206,41 @@ class Device:
         omega = photon_energies / hbar  # angular frequencies in rad/s
         k = omega / c_0
 
-        #Now there is the periodicity to consider, introduced via the distance_r
-        distance_r = self.distance()  # (Nlattice,N,N,3) is periodic
-        r = xp.linalg.norm(distance_r, axis=-1)  # (Nlattice, N, N, 3)
+        # Now there is the periodicity to consider, introduced via the distance_r
+        r = xp.linalg.norm(self.distances_r, axis=-1)  # (Nlattice, N, N, 3)
         r_norm = r.copy()
 
         # for i in range(r.shape[0]):   # loop over lattice images
         #     xp.fill_diagonal(r_norm[i], xp.inf)
-            # # Set diagonal to zero (Do we exclude self-interaction here?)
+        # # Set diagonal to zero (Do we exclude self-interaction here?)
         # for m in range(D0.shape[0]):
         #     xp.fill_diagonal(D0[m], 0.0)
 
-        xp.fill_diagonal(r_norm[0], xp.inf)  # look a r_norm[Nlattice] exclude self term in central cell
-        #xp.fill_diagonal(r_norm, xp.inf) #for 2D diagonal elements set to inf to avoid division by zero
-        
+        xp.fill_diagonal(
+            r_norm[0], xp.inf
+        )  # look a r_norm[Nlattice] exclude self term in central cell
+        # xp.fill_diagonal(r_norm, xp.inf) #for 2D diagonal elements set to inf to avoid division by zero
+
         D_images = xp.exp(1j * k[:, None, None, None] * r_norm[None, ...]) / (
             4 * xp.pi * r_norm[None, ...]
         )
-    
+
         # Sum over images → gives periodic D0
         D0 = D_images.sum(axis=1)  # (Nw, N, N)
 
-        print("D0 shape is:",D0.shape) 
+        print("D0 shape is:", D0.shape)
         return D0  # shape (Nw,N,N)
-        
+
     def compute_d0_delta_perp(self, photon_energies):
-        
+
         D0 = self.compute_d0(photon_energies)
-        sigma=1e-10
-        tol=0.0
-        N = self.distances.shape[0]
+        sigma = 1e-10
+        tol = 0.0
+        N = self.distances_r.shape[0]
         pref = 1.0 / (4.0 * xp.pi)
 
         # self.distances
-        r_mn_2 = xp.sum(self.distances**2, axis=2)
+        r_mn_2 = xp.sum(self.distances_r**2, axis=2)
         r_mn = xp.sqrt(r_mn_2)
 
         mark = r_mn > 0
@@ -250,9 +255,9 @@ class Device:
 
         delta_transverse = {}
         for i in range(3):
-            ri = self.distances[..., i]  # (N,N)
+            ri = self.distances_r[..., i]  # (N,N)
             for j in range(3):
-                rj = self.distances[..., j]
+                rj = self.distances_r[..., j]
                 delta_ij = 1.0 if i == j else 0.0
 
                 # δ⊥_{ij}} = δ_ab δ^{(3)}(r)  +  pref * [ 3 r_a r_b / r^5  - δ_ab * r^2 / r^5 ]
@@ -269,8 +274,6 @@ class Device:
                     ).tocsr()
                 else:
                     delta_transverse[(i, j)] = sp.csr_matrix(delta_transversal)
-            
-            
 
         # stack into dense tensor Delta[i,j,u,v]
         Delta = xp.empty(
@@ -279,14 +282,13 @@ class Device:
         for u in range(3):
             for v in range(3):
                 D_t = delta_transverse[(u, v)]
-                Delta[:, :, u, v] = D_t.toarray() if sp.issparse(D_t) else xp.asarray(D_t)
+                Delta[:, :, u, v] = (
+                    D_t.toarray() if sp.issparse(D_t) else xp.asarray(D_t)
+                )
 
-        out = oe.contract("wij,jkuv->wikuv", D0, Delta) # shape (Nw, N, N, 3, 3)
+        out = oe.contract("wij,jkuv->wikuv", D0, Delta)  # shape (Nw, N, N, 3, 3)
         rearranged_out = einops.rearrange(
             out,
             "m i j u v -> m u v i j",
-        )  
+        )
         return rearranged_out  # (Nw, 3,3, N, N)
-
-
-

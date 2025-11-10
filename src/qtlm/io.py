@@ -4,7 +4,6 @@ from mpi4py.MPI import COMM_WORLD as comm
 from mpi4py.util import pkl5
 
 from qtlm import NDArray, xp
-import numpy as np
 
 comm = pkl5.Intracomm(comm)
 

@@ -7,6 +7,7 @@ from qtlm.scattering.device import Device
 
 device = Device()
 
+
 def main(config_file: Path):
     """Calculates transport through the structure.
 
