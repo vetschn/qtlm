@@ -40,13 +40,18 @@ class SCBA:
             sigma_lesser=xp.zeros((device.num_kpts, device.num_orbitals, device.num_orbitals), dtype=xp.complex128),
             sigma_greater=xp.zeros((device.num_kpts, device.num_orbitals, device.num_orbitals), dtype=xp.complex128),
         )
+        self.sigma_lesser_old = self.data.sigma_lesser.copy()
+        self.sigma_lesser_new = self.data.sigma_lesser.copy()
+    
     #uhm why is sigma lesser and greater looked as a function of the number of k-points if at the end we have the energy. Something is odd????????????
     def _has_converged(self) -> bool:
-        return False  # Placeholder for convergence check logic.
+        # sigma_diff = xp.linalg.norm(self.data.sigma_lesser - self.data.sigma_lesser)  # type: ignore
+        return False #sigma_diff < 1e-6  # Placeholder for convergence check logic.
 
     def run(self):
         for i in range(self.max_iterations):
             print(f"SCBA iteration {i+1} -----------------------------")
+            #self.sigma_lesser_old = self.data.sigma_lesser.copy()
             self.data.g_lesser, self.data.g_greater = self.electron_solver.solve(
                 self.data.sigma_lesser,
                 self.data.sigma_greater,
@@ -75,6 +80,7 @@ class SCBA:
                 self.data.d_greater,
             )
             print("Self-energies computed.")
+            #self.sigma_lesser_new = self.data.sigma_lesser.copy()
 
             if self._has_converged():
                 break

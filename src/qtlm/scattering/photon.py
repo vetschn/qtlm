@@ -197,5 +197,5 @@ class PhotonSolver:
             @ (pi_greater)
             @ d_retarded.conj().swapaxes(-2, -1)
         )
-        print("you made it! Photon Green's functions computed.")
+
         return d_lesser, d_greater

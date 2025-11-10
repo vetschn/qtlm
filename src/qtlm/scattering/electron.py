@@ -129,48 +129,45 @@ class ElectronSolver:
         self._assemble_system_matrix(
             (sigma_greater - sigma_lesser) / 2
         )  # (625->441 (because k-space), 156 ->104 (because of boundary conditons?), 156->104)
-        sigma_obc_lesser, sigma_obc_greater, sigma_obc_retarded = (
-            self._compute_obc()
-        )  # dimenesions (300, 441, 104, 104)
+        
+        if xp.all(sigma_lesser==0):
+            
+            sigma_obc_lesser, sigma_obc_greater, sigma_obc_retarded = (
+                self._compute_obc()
+            )  # dimenesions (300, 441, 104, 104)
+            sigma_lesser = sigma_lesser[..., *device.inds_cc] + sigma_obc_lesser # naming to be improved
+            sigma_greater = sigma_greater[..., *device.inds_cc] + sigma_obc_greater
+            self.system_matrix = self.system_matrix[..., *device.inds_cc] 
+
+            sigma_retarded = sigma_obc_retarded # naming to be improved
+
+            print("sigma lesser shape:", sigma_lesser.shape, " sigma obc lesser shape:", sigma_obc_lesser.shape)
+
+        else:
+            sigma_retarded = (sigma_greater - sigma_lesser) / 2  # naming to be improved
+
 
         # Solve.
         print("Inverting system matrix to get g_retarded...")
         time_start = time.perf_counter()
         g_retarded = linalg.inv(
-            self.system_matrix[..., *device.inds_cc] - sigma_obc_retarded
-        )  # (300, 441, 104, 104) put some indice, so shape match, maybe for conscitency and logic there is a better one
+            self.system_matrix - sigma_retarded 
+        )  
         time_end = time.perf_counter()
         print(f"Time to invert system matrix: {time_end - time_start:.3f} s")
 
+        
+        
         # Compute lesser and greater Green's functions
+        g_lesser = (
+            g_retarded
+            @ (sigma_lesser) # naming to be improved
+            @ g_retarded.conj().swapaxes(-2, -1)
+        )
+        g_greater = (
+            g_retarded
+            @ (sigma_greater) # naming to be improved
+            @ g_retarded.conj().swapaxes(-2, -1)
+        )
         
-        if sigma_lesser.shape != sigma_obc_lesser.shape:
-            print("sigma lesser shape:", sigma_lesser.shape, " sigma obc lesser shape:", sigma_obc_lesser.shape)
-            g_lesser = (
-                g_retarded
-                @ (sigma_lesser[..., *device.inds_cc] + sigma_obc_lesser)
-                @ g_retarded.conj().swapaxes(-2, -1)
-            )
-            g_greater = (
-                g_retarded
-                @ (sigma_greater[..., *device.inds_cc] + sigma_obc_greater)
-                @ g_retarded.conj().swapaxes(-2, -1)
-            )
-        
-        else:
-            g_lesser = (
-                g_retarded
-                @ (sigma_lesser+ sigma_obc_lesser)
-                @ g_retarded.conj().swapaxes(-2, -1)
-            )
-            g_greater = (
-                g_retarded
-                @ (sigma_greater+ sigma_obc_greater)
-                @ g_retarded.conj().swapaxes(-2, -1)
-            )
-            prin("g_lesser shape:", g_lesser.shape, " g_greater shape:", g_greater.shape)
-
-
-        print("you made it! electron solver runs")
-
         return g_lesser, g_greater

@@ -185,6 +185,5 @@ class SelfEnergy:
 
         # select only selected electron energies and corresponding polarization values
         print("shape of self-energy: ", sigma_selected.shape)
-        print("you made it self-energy runs")
 
         return sigma_selected

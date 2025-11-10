@@ -186,7 +186,6 @@ class Polarization:
         # --- detailed balance: Π^>(ω) = iΠ^<(-hbarω) ---
         #reshape polarization (Nw,3,3,N,N) mit einops
 
-        print("you made it! poalarization runs")
         pi_lesser = einops.rearrange(
             p_polarization_selected,
             "e m n u v -> e u v m n",
