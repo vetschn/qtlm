@@ -145,13 +145,13 @@ class SelfEnergy:
                 )
 
                 term_holder[:,k,...] = Term  # (Np, N, N)
-            
-            if summation_terms is None:
-                    summation_terms = term_holder
-            else:
-                summation_terms += term_holder
+            #sum over indices
+        if summation_terms is None:
+            summation_terms = term_holder
+        else:
+            summation_terms += term_holder
 
-            del Term
+        del Term
 
 
         end_einsum_timer = time.perf_counter()

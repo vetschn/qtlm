@@ -80,11 +80,17 @@ class Polarization:
             f"FFT took {end_fft_timer - start_fft_timer:.3f}s"
         )  # np : 9.933s  | scipy : 9.911s
         
-        interaction_tensor = (device.interaction_tensor.astype(
+
+       
+        interaction_tensor_r = (device.interaction_tensor.astype(
             xp.complex128, copy=False
         ))[...,*device.inds_cc,:]  # (Nl,N, N,3)
         # erreur potentielle car interaction tensor N lattice pas k-space
-        print("Interaction tensor shape:", interaction_tensor.shape, "g_lesser_fft shape:", g_lesser_fft.shape, "g_greater_fft shape:", g_greater_fft.shape)
+        phases = oe.contract("ik,jk->ij", device.kpts, device.r_vectors)
+        phase_factors = xp.exp(2j * xp.pi * phases)
+        interaction_tensor_k = oe.contract("ij,jmnu->imnu", phase_factors, interaction_tensor_r)  # (Nk,N,N,3)
+
+        print("Interaction tensor shape:", interaction_tensor_k.shape, "g_lesser_fft shape:", g_lesser_fft.shape, "g_greater_fft shape:", g_greater_fft.shape)
 
         print("Starting the big summation over k-points and contraction, BE PATIENT...")    
         start = time.perf_counter()
@@ -99,9 +105,9 @@ class Polarization:
         for i in indices_list:
             path, path_info = oe.contract_path(
                 i,
-                interaction_tensor[0,:,:,:],
+                interaction_tensor_k[0,:,:,:],
                 g_lesser_fft[:, 0, :, :],
-                interaction_tensor[0,:,:,:],
+                interaction_tensor_k[0,:,:,:],
                 g_greater_fft[:, 0, :, :],
                 optimize="optimal",
                 memory_limit="max_input",
@@ -127,9 +133,9 @@ class Polarization:
                 # )
                 Term_k = oe.contract(
                     i,
-                    interaction_tensor[k,:,:,:],
+                    interaction_tensor_k[k,:,:,:],
                     g_lesser_fft[:, k, :, :],
-                    interaction_tensor[k,:,:,:],
+                    interaction_tensor_k[k,:,:,:],
                     g_greater_fft[:, k, :, :],
                     optimize=path_mem[indices_list.index(i)],
                     memory_limit="max_input",
