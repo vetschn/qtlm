@@ -129,6 +129,7 @@ class SCBA:
             "d_greater": self.data.d_greater,
             "sigma_lesser": self.data.sigma_lesser,
             "sigma_greater": self.data.sigma_greater,
+            "interaction_tensor_k": device.interaction_tensor_k,
         }
 
         for key, value in outputs.items():
