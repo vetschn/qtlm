@@ -4,8 +4,9 @@ from ase.dft import kpoints
 import numpy as np
 import opt_einsum as oe
 import scipy.sparse as sp
-from qtlm.constants import hbar, c_0, e
-import einops
+from qtlm.constants import h, c_0, e
+from qtlm.config import QTLMConfig
+import time
 import ase.io
 
 
@@ -51,7 +52,7 @@ class Device:
 
         return cls._instance
 
-    def configure(self, config):
+    def configure(self, config: QTLMConfig):
         """Configures the device by loading tight-binding data."""
         if self._is_configured:
             raise RuntimeError("Device is already configured.")
@@ -79,7 +80,9 @@ class Device:
 
         # NOTE: We don't REALLY need to store all distances in memory.
         # Could just be the norms.
-        self.distances_r = self._compute_distances()  # (Nlattice,N,N,3)
+        self.distances_r = (
+            self._compute_distances()
+        )  # (Nlattice, Norb, Norb, 3) in Angstrom
         # Precompute interaction tensor.
         self.interaction_tensor_k = self._assemble_interaction_tensor_k()
 
@@ -103,35 +106,35 @@ class Device:
     def _compute_distances(self) -> NDArray:
         """Returns the distance matrix between orbitals."""
 
-        # self.lattice, self_r_vectors,
         distances_r = np.zeros(
             (self.r_vectors.shape[0], self.num_orbitals, self.num_orbitals, 3)
-        )  # (num_images, N, N, 3)
+        )  # (N_images, Norb, Norb, 3)
 
         for i, vec in enumerate(self.r_vectors):
             image_position = (
                 self.orbital_positions + vec @ self.lattice_vectors
-            )  # (N, N, 3)
+            )  # (Norb, Norb, 3)
             distances_r[i] = (
                 self.orbital_positions[:, np.newaxis] - image_position[np.newaxis, :]
-            )  # (Nlattice,N, N, 3)
+            )  # (Nlattice, N_orb,  N_orb, 3)
 
-        return distances_r
+        return distances_r  # (Nlattice, Norb, Norb, 3) in Angstrom
 
     def _assemble_interaction_tensor_k(self) -> NDArray:
 
-        prefactor = (-e / 2.0) * (1j / hbar)
+        prefactor = (-e / 2.0) * (1j / (h / (2 * xp.pi)))
         interaction_tensor_r = (
             prefactor * self.hamiltonian_r[..., np.newaxis] * self.distances_r
-        )  # CPU
+        )  # (Nlattice, Norb, Norb, 3)  - Maybe not GPU friendly
+
         # transform to k-space
         phases = oe.contract("ik,jk->ij", self.kpts, self.r_vectors)
         phase_factors = xp.exp(2j * xp.pi * phases)
         interaction_tensor_k = oe.contract(
             "ij,jklm->iklm", phase_factors, interaction_tensor_r
-        )  # (Nk,N,N,3)
+        )
 
-        return interaction_tensor_k  # Nlattice,N, N,3
+        return interaction_tensor_k  # (Nk, Norb, Norb, 3)
 
     def _init_contacts(self):
         """Initializes the indices for the contact regions."""
@@ -198,48 +201,37 @@ class Device:
 
     def compute_d0(self, photon_energies):
         """
-        3D tensor D0[m, i, j] of Initial Photon Green's functions between each pair (n,m) of positions
-        R_positions : (N,3) array of positions of orbitals
-        E_eV_array : (M,) array of energies in eV ((invented))
+        Computes the non interaction response d_0.
         """
 
-        omega = photon_energies / hbar  # angular frequencies in rad/s
+        omega = ((2 * xp.pi) * photon_energies) / h  # angular frequencies in rad/s
         k = omega / c_0
 
         # Now there is the periodicity to consider, introduced via the distance_r
-        r = xp.linalg.norm(self.distances_r, axis=-1)  # (Nlattice, N, N, 3)
+        r = xp.linalg.norm(self.distances_r, axis=-1)  # (Nlattice, Norb, Norb, 3)
         r_norm = r.copy()
-
-        # for i in range(r.shape[0]):   # loop over lattice images
-        #     xp.fill_diagonal(r_norm[i], xp.inf)
-        # # Set diagonal to zero (Do we exclude self-interaction here?)
-        # for m in range(D0.shape[0]):
-        #     xp.fill_diagonal(D0[m], 0.0)
 
         xp.fill_diagonal(
             r_norm[0], xp.inf
         )  # look a r_norm[Nlattice] exclude self term in central cell
-        # xp.fill_diagonal(r_norm, xp.inf) #for 2D diagonal elements set to inf to avoid division by zero
 
-        D_images = xp.exp(1j * k[:, None, None, None] * r_norm[None, ...]) / (
+        d_images = xp.exp(1j * k[:, None, None, None] * r_norm[None, ...]) / (
             4 * xp.pi * r_norm[None, ...]
-        )
+        )  # TODO: because of exponential always get runtimewarning: invalid value encountered in divide maybe bc of xp.inf
 
         # Sum over images → gives periodic D0
-        D0 = D_images.sum(axis=1)  # (Nw, N, N)
+        d_0 = d_images.sum(axis=1)
+        print("Non Interaction Response d_0 computed")
 
-        print("D0 shape is:", D0.shape)
-        return D0  # shape (Nw,N,N)
+        return d_0  # shape (Nw, Norb, Norb)
 
+    # Note: currently not used
     def compute_d0_delta_perp(self, photon_energies):
 
-        D0 = self.compute_d0(photon_energies)
+        d_0 = self.compute_d0(photon_energies)
         sigma = 1e-10
-        tol = 0.0
-        N = self.distances_r.shape[0]
         pref = 1.0 / (4.0 * xp.pi)
 
-        # self.distances
         r_mn_2 = xp.sum(self.distances_r**2, axis=2)
         r_mn = xp.sqrt(r_mn_2)
 
@@ -247,7 +239,7 @@ class Device:
 
         # δ^{(3)}(r) ~ gaussienne 3D
         norm = (2.0 * sigma**2 * xp.pi) ** (-3 / 2)
-        delta_3D = norm * xp.exp(-r_mn_2 / (2.0 * sigma**2))  # (N,N)
+        delta_3D = norm * xp.exp(-r_mn_2 / (2.0 * sigma**2))
 
         # Hessian Matrix of 1/r for r!=0 : ∂i∂j(1/r) = (3 r_i r_j - r^2 δ_ij)/r^5
         inv_r5 = xp.zeros_like(r_mn)
@@ -255,40 +247,30 @@ class Device:
 
         delta_transverse = {}
         for i in range(3):
-            ri = self.distances_r[..., i]  # (N,N)
+            ri = self.distances_r[..., i]
             for j in range(3):
                 rj = self.distances_r[..., j]
                 delta_ij = 1.0 if i == j else 0.0
-
                 # δ⊥_{ij}} = δ_ab δ^{(3)}(r)  +  pref * [ 3 r_a r_b / r^5  - δ_ab * r^2 / r^5 ]
                 delta_transversal = delta_ij * delta_3D + pref * (
                     3.0 * ri * rj * inv_r5 - delta_ij * r_mn_2 * inv_r5
                 )
+                delta_transverse[(i, j)] = sp.csr_matrix(delta_transversal)
 
-                if tol > 0.0:
-                    keep = xp.abs(delta_transversal) > tol
-                    rows, cols = xp.nonzero(keep)
-                    data = delta_transversal[keep]
-                    delta_transverse[(i, j)] = sp.coo_matrix(
-                        (data, (rows, cols)), shape=(N, N)
-                    ).tocsr()
-                else:
-                    delta_transverse[(i, j)] = sp.csr_matrix(delta_transversal)
-
-        # stack into dense tensor Delta[i,j,u,v]
-        Delta = xp.empty(
-            (self.num_orbitals, self.num_orbitals, 3, 3), dtype=float
-        )  # or complex if needed
+        # stack into dense tensor Delta[u, v, Norb, Norb]
+        Delta = xp.empty((3, 3, self.num_orbitals, self.num_orbitals), dtype=float)
         for u in range(3):
             for v in range(3):
                 D_t = delta_transverse[(u, v)]
-                Delta[:, :, u, v] = (
+                Delta[u, v, :, :] = (
                     D_t.toarray() if sp.issparse(D_t) else xp.asarray(D_t)
                 )
 
-        out = oe.contract("wij,jkuv->wikuv", D0, Delta)  # shape (Nw, N, N, 3, 3)
-        rearranged_out = einops.rearrange(
-            out,
-            "m i j u v -> m u v i j",
+        start = time.perf_counter()
+        out = xp.einsum("wij,uvjk->uvwik", d_0, Delta)  # shape (Nw, 3, 3, Norb, Norb)
+        end = time.perf_counter()
+        print(
+            f"matrix multiplication between d_0 and delta transversal took: {end - start:.3f}s"
         )
-        return rearranged_out  # (Nw, 3,3, N, N)
+
+        return out  # (Nw, 3, 3, Norb, Norb)

@@ -6,7 +6,7 @@ from qtlm.scattering.electron import ElectronSolver
 from qtlm.scattering.photon import PhotonSolver
 from qtlm.scattering.polarization import Polarization
 from qtlm.scattering.self_energy import SelfEnergy
-
+from qtlm.config import QTLMConfig
 
 device = Device()
 
@@ -30,7 +30,7 @@ class SCBAData:
 
 class SCBA:
 
-    def __init__(self, config):
+    def __init__(self, config: QTLMConfig):
 
         self.config = config
         self.output_dir = config.output_dir
@@ -40,10 +40,11 @@ class SCBA:
         self.photon_solver = PhotonSolver(config)
         self.self_energy = SelfEnergy(config)
 
+        # initialize data container for transversal sse (Ne, Nk, Norb, Norb)
         self.data = SCBAData(
             sigma_lesser=xp.zeros(
                 (
-                    config.electron.energies.shape[0],
+                    config.electron.energies.size,
                     device.num_kpts,
                     device.num_orbitals,
                     device.num_orbitals,
@@ -52,7 +53,7 @@ class SCBA:
             ),
             sigma_greater=xp.zeros(
                 (
-                    config.electron.energies.shape[0],
+                    config.electron.energies.size,
                     device.num_kpts,
                     device.num_orbitals,  # device.inds_cc[0].stop - device.inds_cc[0].start,
                     device.num_orbitals,  # device.inds_cc[1].stop - device.inds_cc[1].start, WARUM?
@@ -60,28 +61,29 @@ class SCBA:
                 dtype=xp.complex128,
             ),
         )
+        xp.save(self.output_dir / "sigma_initial.npy", self.data.sigma_lesser)
 
-    # uhm why is sigma lesser and greater looked as a function of the number of k-points if at the end we have the energy. Something is odd????????????
     def _has_converged(self, old: NDArray, new: NDArray) -> bool:
-        sigma_diff = xp.abs(old - new)  # type: ignore
-        return sigma_diff.all() < 1e-6  # Placeholder for convergence check logic.
+        sigma_diff = xp.linalg.norm(new - old) / xp.linalg.norm(old)
+        return sigma_diff < 1e-6
 
     def run(self):
         """Runs the SCBA calculation."""
         for i in range(self.max_iterations):
             print(f"SCBA iteration {i+1} -----------------------------")
 
+            # for convergence criterion
+            # TODO: does not look nice
+            if i == 0:
+                sigma_lesser_old = (self.data.sigma_lesser[..., *device.inds_cc]).copy()
+            else:
+                sigma_lesser_old = sigma_lesser_new
+
             self.data.g_lesser, self.data.g_greater = self.electron_solver.solve(
                 self.data.sigma_lesser,
                 self.data.sigma_greater,
             )
             print("Electron Green's functions computed.")
-
-            # not nice but works for now
-            if i == 0:
-                sigma_lesser_old = (self.data.sigma_lesser[..., *device.inds_cc]).copy()
-            else:
-                sigma_lesser_old = sigma_lesser_new
 
             self.data.pi_lesser, self.data.pi_greater = self.polarization.compute(
                 self.data.g_lesser,
@@ -105,32 +107,31 @@ class SCBA:
             )
             print("Self-energies computed.")
 
+            # for convergence criterion
             sigma_lesser_new = self.data.sigma_lesser.copy()
 
+            # save final results if converged
             if self._has_converged(sigma_lesser_old, sigma_lesser_new):
-                self.save_results()
+                # self.save_results()
                 break
 
-        else:  # Did not break.
+        else:  # if did not break.
             print("SCBA did not converge within the maximum number of iterations.")
 
-        # Persist results to the configured output directory so the CLI's
-        # message about the output folder is accurate.
+    # def save_results(self) -> None:
+    #     """Save important input and results of SCBA under `output_dir`."""
 
-    def save_results(self) -> None:
-        """Save available SCBA arrays to files under `output_dir`."""
+    #     outputs = {
+    #         "g_lesser": self.data.g_lesser,
+    #         "g_greater": self.data.g_greater,
+    #         "pi_lesser": self.data.pi_lesser,
+    #         "pi_greater": self.data.pi_greater,
+    #         "d_lesser": self.data.d_lesser,
+    #         "d_greater": self.data.d_greater,
+    #         "sigma_lesser": self.data.sigma_lesser,
+    #         "sigma_greater": self.data.sigma_greater,
+    #         "interaction_tensor_k": device.interaction_tensor_k,
+    #     }
 
-        outputs = {
-            "g_lesser": self.data.g_lesser,
-            "g_greater": self.data.g_greater,
-            "pi_lesser": self.data.pi_lesser,
-            "pi_greater": self.data.pi_greater,
-            "d_lesser": self.data.d_lesser,
-            "d_greater": self.data.d_greater,
-            "sigma_lesser": self.data.sigma_lesser,
-            "sigma_greater": self.data.sigma_greater,
-            "interaction_tensor_k": device.interaction_tensor_k,
-        }
-
-        for key, value in outputs.items():
-            xp.save(self.output_dir / f"{key}.npy", value)
+    #     for key, value in outputs.items():
+    #         xp.save(self.output_dir / f"{key}.npy", value)
