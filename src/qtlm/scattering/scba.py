@@ -39,7 +39,6 @@ class SCBA:
         self.polarization = Polarization(config)
         self.photon_solver = PhotonSolver(config)
         self.self_energy = SelfEnergy(config)
-
         # initialize data container for transversal sse (Ne, Nk, Norb, Norb)
         self.data = SCBAData(
             sigma_lesser=xp.zeros(
@@ -56,16 +55,17 @@ class SCBA:
                     config.electron.energies.size,
                     device.num_kpts,
                     device.num_orbitals,  # device.inds_cc[0].stop - device.inds_cc[0].start,
-                    device.num_orbitals,  # device.inds_cc[1].stop - device.inds_cc[1].start, WARUM?
+                    device.num_orbitals,  # device.inds_cc[1].stop - device.inds_cc[1].start, besser? WARUM?
                 ),
                 dtype=xp.complex128,
             ),
         )
-        xp.save(self.output_dir / "sigma_initial.npy", self.data.sigma_lesser)
 
     def _has_converged(self, old: NDArray, new: NDArray) -> bool:
-        sigma_diff = xp.linalg.norm(new - old) / xp.linalg.norm(old)
-        return sigma_diff < 1e-6
+        """Checks convergence based on the relative change of the self-energy."""
+        tolerance = 1e-3
+        sigma_diff = xp.linalg.norm(new - old) / (xp.linalg.norm(old) + 1e-12)
+        return sigma_diff < tolerance
 
     def run(self):
         """Runs the SCBA calculation."""
@@ -73,11 +73,13 @@ class SCBA:
             print(f"SCBA iteration {i+1} -----------------------------")
 
             # for convergence criterion
-            # TODO: does not look nice
+            # NOTE: does not look nice
             if i == 0:
                 sigma_lesser_old = (self.data.sigma_lesser[..., *device.inds_cc]).copy()
             else:
                 sigma_lesser_old = sigma_lesser_new
+
+            # Solve the coupled electron-photon system
 
             self.data.g_lesser, self.data.g_greater = self.electron_solver.solve(
                 self.data.sigma_lesser,
@@ -112,26 +114,30 @@ class SCBA:
 
             # save final results if converged
             if self._has_converged(sigma_lesser_old, sigma_lesser_new):
-                # self.save_results()
+                self.save_results()
                 break
+            # save intermediate results at iteration 3
+            if i % 3 == 0:
+                self.save_results()
+                print("Intermediate results saved at iteration", i)
 
         else:  # if did not break.
             print("SCBA did not converge within the maximum number of iterations.")
 
-    # def save_results(self) -> None:
-    #     """Save important input and results of SCBA under `output_dir`."""
+    def save_results(self) -> None:
+        """Save important input and results of SCBA under `output_dir`."""
 
-    #     outputs = {
-    #         "g_lesser": self.data.g_lesser,
-    #         "g_greater": self.data.g_greater,
-    #         "pi_lesser": self.data.pi_lesser,
-    #         "pi_greater": self.data.pi_greater,
-    #         "d_lesser": self.data.d_lesser,
-    #         "d_greater": self.data.d_greater,
-    #         "sigma_lesser": self.data.sigma_lesser,
-    #         "sigma_greater": self.data.sigma_greater,
-    #         "interaction_tensor_k": device.interaction_tensor_k,
-    #     }
+        outputs = {
+            "g_lesser": self.data.g_lesser,
+            "g_greater": self.data.g_greater,
+            "pi_lesser": self.data.pi_lesser,
+            "pi_greater": self.data.pi_greater,
+            "d_lesser": self.data.d_lesser,
+            "d_greater": self.data.d_greater,
+            "sigma_lesser": self.data.sigma_lesser,
+            "sigma_greater": self.data.sigma_greater,
+            "interaction_tensor_k": device.interaction_tensor_k,
+        }
 
-    #     for key, value in outputs.items():
-    #         xp.save(self.output_dir / f"{key}.npy", value)
+        for key, value in outputs.items():
+            xp.save(self.output_dir / f"{key}.npy", value)
