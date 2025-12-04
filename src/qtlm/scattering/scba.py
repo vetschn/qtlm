@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 from qtlm import NDArray, xp
+from qtlm.config import QTLMConfig
 from qtlm.scattering.device import Device
 from qtlm.scattering.electron import ElectronSolver
 from qtlm.scattering.photon import PhotonSolver
@@ -27,7 +28,8 @@ class SCBAData:
 
 class SCBA:
 
-    def __init__(self, config):
+    def __init__(self, config: QTLMConfig):
+        self.config = config
 
         self.max_iterations = 100
         self.electron_solver = ElectronSolver(config)
@@ -40,8 +42,8 @@ class SCBA:
                 (
                     config.electron.energies.size,
                     device.num_kpts,
-                    device.inds_cc[0].stop - device.inds_cc[0].start,
-                    device.inds_cc[1].stop - device.inds_cc[1].start,
+                    device.num_orbitals,
+                    device.num_orbitals,
                 ),
                 dtype=xp.complex128,
             ),
@@ -49,8 +51,8 @@ class SCBA:
                 (
                     config.electron.energies.size,
                     device.num_kpts,
-                    device.inds_cc[0].stop - device.inds_cc[0].start,
-                    device.inds_cc[1].stop - device.inds_cc[1].start,
+                    device.num_orbitals,
+                    device.num_orbitals,
                 ),
                 dtype=xp.complex128,
             ),
@@ -62,6 +64,14 @@ class SCBA:
 
     def run(self):
         """Runs the SCBA calculation."""
+        xp.savetxt(
+            self.config.output_dir / "electron_energies.dat",
+            self.electron_solver.energies,
+        )
+        xp.savetxt(
+            self.config.output_dir / "photon_energies.dat",
+            self.photon_solver.energies,
+        )
         for i in range(self.max_iterations):
             print(f"SCBA iteration {i+1} -----------------------------")
             self.data.g_lesser, self.data.g_greater = self.electron_solver.solve(
@@ -70,11 +80,30 @@ class SCBA:
             )
             print("Electron Green's functions computed.")
 
+            xp.save(
+                self.config.output_dir / f"g_lesser_{i+1}.npy",
+                self.data.g_lesser,
+            )
+            xp.save(
+                self.config.output_dir / f"g_greater_{i+1}.npy",
+                self.data.g_greater,
+            )
+
             self.data.pi_lesser, self.data.pi_greater = self.polarization.compute(
                 self.data.g_lesser,
                 self.data.g_greater,
             )
             print("Polarization computed.")
+
+            # Save polarization for analysis
+            xp.save(
+                self.config.output_dir / f"pi_lesser_{i+1}.npy",
+                self.data.pi_lesser,
+            )
+            xp.save(
+                self.config.output_dir / f"pi_greater_{i+1}.npy",
+                self.data.pi_greater,
+            )
 
             self.data.d_lesser, self.data.d_greater = self.photon_solver.solve(
                 self.data.pi_lesser,
@@ -82,15 +111,32 @@ class SCBA:
             )
             print("Photon Green's functions computed.")
 
-            self.data.sigma_lesser = self.self_energy.compute(
-                self.data.g_lesser,
+            xp.save(
+                self.config.output_dir / f"d_lesser_{i+1}.npy",
                 self.data.d_lesser,
             )
-            self.data.sigma_greater = self.self_energy.compute(
-                self.data.g_greater,
+            xp.save(
+                self.config.output_dir / f"d_greater_{i+1}.npy",
                 self.data.d_greater,
             )
+
+            self.data.sigma_lesser, self.data.sigma_greater = self.self_energy.compute(
+                self.data.g_lesser,
+                self.data.g_greater,
+                self.data.d_lesser,
+                self.data.d_greater,
+            )
+
             print("Self-energies computed.")
+
+            xp.save(
+                self.config.output_dir / f"sigma_lesser_{i+1}.npy",
+                self.data.sigma_lesser,
+            )
+            xp.save(
+                self.config.output_dir / f"sigma_greater_{i+1}.npy",
+                self.data.sigma_greater,
+            )
 
             if self._has_converged():
                 break

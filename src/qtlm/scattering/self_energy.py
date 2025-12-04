@@ -6,32 +6,33 @@ import scipy
 
 from qtlm import NDArray, xp
 from qtlm.config import QTLMConfig
-from qtlm.constants import mu_0
 from qtlm.scattering.device import Device
 
 device = Device()
 
 
 class SelfEnergy:
-    """Photon self-energy within the self-consistent Born approximation (SCBA).
+    """Calculator for the transversal photon self-energy.
 
-    Attributes:
-      compute_config:  ComputeConfig
-      qc:              QuatrexConfig
-      m_interaction:   (N, N, 3)   real/complex, energy-independent
+    Parameters
+    ----------
+    config : QTLMConfig
+        Configuration object.
+
     """
 
     def __init__(self, config: QTLMConfig) -> None:
-
-        # grids
+        """Initializes the SelfEnergy calculator."""
         self.electron_energies = config.electron.energies
         self.photon_energies = config.photon.energies
 
-        # constants
-        self.prefactor = 1j * mu_0 * (1 / (2 * xp.pi))
         self.dE = xp.abs(self.electron_energies[1] - self.electron_energies[0])
         self.dhw = xp.abs(self.photon_energies[1] - self.photon_energies[0])
 
+        self.prefactor = 1j / (2 * xp.pi) * self.dE
+
+        # Check that the energy grids are uniformly spaced and
+        # commensurate.
         if not xp.allclose(
             xp.diff(self.electron_energies), self.dE, rtol=1e-6, atol=1e-12
         ):
@@ -49,158 +50,137 @@ class SelfEnergy:
 
     def compute(
         self,
-        g_electron: NDArray,
-        d_photon: NDArray,
+        g_lesser: NDArray,
+        g_greater: NDArray,
+        d_lesser: NDArray,
+        d_greater: NDArray,
     ) -> None:
-        """Compute the photon self-energy Σ.
+        """Computes the transversal photon self-energy using FFTs.
 
-        Args:
-          g:        (Ne, N, N) complex
-          d:        (Nw, 3, 3, N, N) complex
-          outputs:  tuple of NDArray to store results
-                    each of shape (Nw, N, N, 3, 3) complex
+        Parameters
+        ----------
+        g_lesser : NDArray
+            Lesser electron Green's function.
+        g_greater : NDArray
+            Greater electron Green's function.
+        d_lesser : NDArray
+            Lesser photon Green's function.
+        d_greater : NDArray
+            Greater photon Green's function.
+
+        Returns
+        -------
+        sigma_lesser : NDArray
+            Lesser transversal self-energy.
+        sigma_greater : NDArray
+            Greater transversal self-energy.
+
         """
 
         # compute self-energy
         print("Starting FFT based transversal self-energy computation...")
+        num_photon_energies = d_lesser.shape[0]
+        num_electron_energies, num_kpts, *__ = g_lesser.shape
 
-        d__photon_reshaped = einops.rearrange(
-            d_photon, "e m n u v -> e u v m n"
-        )  # (Nw, 3, 3, N,N)
+        # Determine the padding for the FFT.
+        n = num_photon_energies + num_electron_energies - 1
 
-        Nw = d_photon.shape[0]
-        Ne, Nk, _, _ = g_electron.shape
-        print(
-            "d_photon reshaped shape:",
-            d__photon_reshaped.shape,
-            "g_electron shape:",
-            g_electron.shape,
-        )
+        d_lesser_reshaped = einops.rearrange(d_lesser, "e m n u v -> e u v m n")
+        d_greater_reshaped = einops.rearrange(d_greater, "e m n u v -> e u v m n")
 
-        n = Nw + Ne - 1  # padding
-        # FFT: energy/frequency domain to time domain: energy -> tau
-        start_ifft_timer = time.perf_counter()
-        g_electron_fft = scipy.fft.fft(g_electron, n, axis=0, workers=128)  # (Np, N, N)
-        # reverse the order to get G(tau)#TODO: change to the fastest option
-        g_electron_fft = xp.flip(g_electron_fft, axis=0)
-        # G_IFFT = xp.conj(G_IFFT[::-1, ...])  # reverse the order to get G(tau)
-        # (Np, N, N)
-        d_photon_fft = scipy.fft.fft(d__photon_reshaped, n, axis=0, workers=128)
+        start_fft_timer = time.perf_counter()
+        g_lesser_fft = scipy.fft.fft(g_lesser, n, axis=0, workers=128)
+        g_greater_fft = scipy.fft.fft(g_greater, n, axis=0, workers=128)
+        d_lesser_fft = scipy.fft.fft(d_lesser_reshaped, n, axis=0, workers=128)
+        d_greater_fft = scipy.fft.fft(d_greater_reshaped, n, axis=0, workers=128)
         end_ifft_timer = time.perf_counter()
 
-        print(
-            f"first fourier transform took {end_ifft_timer - start_ifft_timer:.3f}s"
-        )  # np : 27.7 sec | scipy : 0.989s
-
-        # (Nl,N, N,3)
-        interaction_tensor = (
-            device.interaction_tensor_k.astype(xp.complex128, copy=False)
-        )[..., *device.inds_cc, :]
+        print(f"FFT took {end_ifft_timer - start_fft_timer:.3f}s")
 
         # Get the term for the transverse self-energy
-        start_einsum_timer = time.perf_counter()
-        indices_list = [
+        start = time.perf_counter()
+        contraction_subscripts = [
             "iju,til,lkv,tikuv->tjk",
-            "iju,til,lkv,tiluv->tjk",  # optimized scaling at 6
-            "iju,til,lkv,tjkuv->tjk",  # optimized scaling at 6
+            "iju,til,lkv,tiluv->tjk",
+            "iju,til,lkv,tjkuv->tjk",
             "iju,til,lkv,tjluv->tjk",
         ]
-        path_mem = []
-        for i in indices_list:
-            path, _ = oe.contract_path(
-                i,
-                interaction_tensor[0, ...],
-                g_electron_fft[:, 0, ...],
-                interaction_tensor[0, ...],
-                d_photon_fft,
+        contraction_paths = []
+        for subscripts in contraction_subscripts:
+            path, __ = oe.contract_path(
+                subscripts,
+                device.interaction_tensor_k[0, ...],
+                g_lesser_fft[:, 0, ...],
+                device.interaction_tensor_k[0, ...],
+                d_lesser_fft,
                 optimize="optimal",
                 memory_limit="max_input",
             )
-            path_mem.append(path)
+            contraction_paths.append(path)
 
-        # summation_terms = None
-
-        Sigma_full_fft = xp.zeros_like(g_electron_fft)
-        for i in indices_list:
-            # summation_over_k = None
-            for k in range(Nk):
-                # start = time.perf_counter()
-                # path, path_info = oe.contract_path(
-                #     i,
-                #     device.interaction_tensor,
-                #     g_electron_fft,
-                #     device.interaction_tensor,
-                #     d_photon_fft,
-                #     optimize="optimal",
-                #     memory_limit="max_input",
-                # )
-                # end = time.perf_counter()
-                # print(
-                #     path_info,
-                # )  # optionnel: affiche le plan de contraction
-                # print(end - start)
-
-                Sigma_full_fft[:, k] = oe.contract(
-                    i,
-                    interaction_tensor[k, ...],
-                    g_electron_fft[:, k, ...],
-                    interaction_tensor[k, ...],
-                    d_photon_fft,
-                    optimize=path_mem[indices_list.index(i)],
+        sigma_lesser_fft = xp.zeros_like(g_lesser_fft)
+        sigma_greater_fft = xp.zeros_like(g_greater_fft)
+        for subscripts, path in zip(contraction_subscripts, contraction_paths):
+            for k_ind in range(num_kpts):
+                sigma_lesser_fft[:, k_ind] += oe.contract(
+                    subscripts,
+                    device.interaction_tensor_k[k_ind, ...],
+                    g_lesser_fft[:, k_ind, ...],
+                    device.interaction_tensor_k[k_ind, ...],
+                    d_lesser_fft,
+                    optimize=path,
                     memory_limit="max_input",
                 )
-                # # later passes: mutate in place
-                # if summation_over_k is None:
-                #     summation_over_k = Term + 0
-                # else:
-                #     summation_over_k += Term
+                sigma_lesser_fft[:, k_ind] -= oe.contract(
+                    subscripts,
+                    device.interaction_tensor_k[k_ind, ...],
+                    g_lesser_fft[:, k_ind, ...],
+                    device.interaction_tensor_k[k_ind, ...],
+                    d_greater_fft.conj(),
+                    optimize=path,
+                    memory_limit="max_input",
+                )
+                sigma_greater_fft[:, k_ind] += oe.contract(
+                    subscripts,
+                    device.interaction_tensor_k[k_ind, ...],
+                    g_greater_fft[:, k_ind, ...],
+                    device.interaction_tensor_k[k_ind, ...],
+                    d_greater_fft,
+                    optimize=path,
+                    memory_limit="max_input",
+                )
+                sigma_greater_fft[:, k_ind] -= oe.contract(
+                    subscripts,
+                    device.interaction_tensor_k[k_ind, ...],
+                    g_greater_fft[:, k_ind, ...],
+                    device.interaction_tensor_k[k_ind, ...],
+                    d_lesser_fft.conj(),
+                    optimize=path,
+                    memory_limit="max_input",
+                )
 
-                # del Term
+        end = time.perf_counter()
+        print(f"Contraction took {end - start:.3f}s")
 
-            # if summation_terms is None:
-            #     summation_terms = summation_over_k
-            # else:
-            #     summation_terms += summation_over_k
+        print("FFT back is starting...")
 
-            # del summation_over_k
-        end_einsum_timer = time.perf_counter()
-        print(
-            f"summation took {end_einsum_timer - start_einsum_timer:.3f}s"
-        )  # np : 583s | scipy : 5.34s
+        time_fft_start = time.perf_counter()
+        sigma_lesser_full = scipy.fft.ifft(sigma_lesser_fft, axis=0, workers=128)
+        sigma_greater_full = scipy.fft.ifft(sigma_greater_fft, axis=0, workers=128)
+        time_fft_end = time.perf_counter()
 
-        print("Be patient, FFT back is starting...")
+        # NOTE: Save full self-energy for debugging.
+        density = (self.prefactor * sigma_lesser_full)[:, 0].diagonal(
+            axis1=-1, axis2=-2
+        )
+        xp.save("outputs/sigma_full_density.npy", density)
 
-        print(f"{Sigma_full_fft.shape=}")
+        print(f"back fourier transform took {time_fft_end - time_fft_start:.3f}s")
 
-        time_FFT_start = time.perf_counter()
-        Sigma_full = xp.fft.ifft(Sigma_full_fft, axis=0)  # (n, N, N, 3, 3)
-        Sigma_full = self.prefactor * Sigma_full
-        time_FFT_end = time.perf_counter()
-        print(
-            f"back fourier transform took {time_FFT_end - time_FFT_start:.3f}s"
-        )  # in np : 0.583s | scipy : 0.149s
+        sigma_lesser_full = self.prefactor * sigma_lesser_full
+        sigma_greater_full = self.prefactor * sigma_greater_full
 
-        print(f"{Sigma_full.shape=}")
-        # index array
-        idx = xp.round(
-            (self.electron_energies - self.electron_energies[0]) / self.dhw
-        ).astype(int)
+        sigma_lesser = sigma_lesser_full[:num_electron_energies]
+        sigma_greater = sigma_greater_full[:num_electron_energies]
 
-        if xp.any((idx < 0)):
-
-            bad = self.photon_energies[
-                (idx < 0) | (idx > Sigma_full.shape[0])
-            ]  # | (idx >= Sigma_full.shape[0])
-            raise ValueError(f"Some requeste energies fall outside the FFT grid: {bad}")
-
-        elif xp.any(idx > Sigma_full.shape[0]):
-            sigma_selected = Sigma_full
-
-        else:
-            sigma_selected = Sigma_full[idx, ...]  # (NE, N, N, 3, 3)
-
-        # select only selected electron energies and corresponding polarization values
-        print("shape of self-energy: ", sigma_selected.shape)
-        print("you made it self-energy runs")
-
-        return sigma_selected
+        return sigma_lesser, sigma_greater

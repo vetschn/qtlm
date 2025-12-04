@@ -3,7 +3,6 @@ import time
 import einops
 import opt_einsum as oe
 import scipy
-import scipy.sparse as sp
 
 from qtlm import NDArray, xp
 from qtlm.config import QTLMConfig
@@ -13,17 +12,17 @@ device = Device()
 
 
 class Polarization:
-    """Calculator for the transversal polarization."""
+    """Calculator for the transversal polarization.
+
+    Parameters
+    ----------
+    config : QTLMConfig
+        Configuration object.
+
+    """
 
     def __init__(self, config: QTLMConfig) -> None:
-        """Initializes the Polarization calculator.
-
-        Parameters
-        ----------
-        config : QTLMConfig
-            The QTLM configuration.
-
-        """
+        """Initializes the Polarization calculator."""
         self.electron_energies = config.electron.energies
         self.photon_energies = config.photon.energies
 
@@ -32,7 +31,7 @@ class Polarization:
 
         self.prefactor = -1j / xp.pi * self.dE
 
-        # Check thath the energy grids are uniformly spaced and
+        # Check that the energy grids are uniformly spaced and
         # commensurate.
         if not xp.allclose(
             xp.diff(self.electron_energies), self.dE, rtol=1e-6, atol=1e-12
@@ -71,6 +70,7 @@ class Polarization:
         print("Computing polarization...")
 
         num_electron_energies, num_kpts, num_orbitals, __ = g_lesser.shape
+
         # Determine the padding for the FFT.
         n = num_electron_energies + num_electron_energies - 1
         print(" The padding for FFT is:", n)
@@ -137,8 +137,8 @@ class Polarization:
         time_fft_start = time.perf_counter()
         pi_greater_full = scipy.fft.ifft(pi_greater_fft, axis=0, workers=128)
 
-        time_FFT_end = time.perf_counter()
-        print(f"fft took {time_FFT_end - time_fft_start:.3f}s")
+        time_fft_end = time.perf_counter()
+        print(f"fft took {time_fft_end - time_fft_start:.3f}s")
 
         # NOTE: Save full polarization for debugging.
         density = xp.trace(
