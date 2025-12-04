@@ -53,6 +53,8 @@ def read_tight_binding_data(directory: str | Path) -> NDArray:
     comm.barrier()
 
     lattice_vectors = xp.loadtxt(lattice_vectors_filename)
+    if lattice_vectors.ndim == 1:
+        lattice_vectors = lattice_vectors[xp.newaxis]
     print(
         f"Rank {comm.rank} read lattice vectors: {lattice_vectors.shape}.",
         flush=True,

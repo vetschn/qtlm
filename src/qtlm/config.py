@@ -25,6 +25,7 @@ _default_num_orbitals_per_atom = {
     "Se": 13,
     "W": 29,
     "Mo": 29,
+    "X": 1,
 }
 
 
@@ -108,6 +109,8 @@ class PhotonConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    interaction_cutoff: PositiveFloat = 7.5  # angstrom
+
     energy_start: PositiveFloat
     energy_stop: PositiveFloat
     energy_window_num: PositiveInt | None = None
@@ -125,9 +128,7 @@ class PhotonConfig(BaseModel):
                 "Only one of 'energy_window_num' or 'energy_step' should be set."
             )
 
-        if (
-            self.energy_window_num is not None
-        ):  # ich denke only energy step, sould be fixed make life way easier
+        if self.energy_window_num is not None:
             self.energies = xp.linspace(
                 self.energy_start,
                 self.energy_stop,

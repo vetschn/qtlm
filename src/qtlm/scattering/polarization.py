@@ -7,31 +7,33 @@ import scipy.sparse as sp
 
 from qtlm import NDArray, xp
 from qtlm.config import QTLMConfig
-from qtlm.constants import hbar, mu_0
 from qtlm.scattering.device import Device
 
 device = Device()
 
 
-# for initialization
 class Polarization:
+    """Calculator for the transversal polarization."""
 
-    def __init__(
-        self,
-        config: QTLMConfig,
-    ) -> None:
+    def __init__(self, config: QTLMConfig) -> None:
+        """Initializes the Polarization calculator.
+
+        Parameters
+        ----------
+        config : QTLMConfig
+            The QTLM configuration.
+
         """
-        Initialize the Polarization solver.
-        config: QTLMConfig
-        """
-        # small usefull informations
         self.electron_energies = config.electron.energies
         self.photon_energies = config.photon.energies
-        self.prefactor = 1j * mu_0 * (1 / (2 * xp.pi))
 
         self.dE = xp.abs(self.electron_energies[1] - self.electron_energies[0])
         self.dhw = xp.abs(self.photon_energies[1] - self.photon_energies[0])
 
+        self.prefactor = -1j / xp.pi * self.dE
+
+        # Check thath the energy grids are uniformly spaced and
+        # commensurate.
         if not xp.allclose(
             xp.diff(self.electron_energies), self.dE, rtol=1e-6, atol=1e-12
         ):
@@ -48,145 +50,117 @@ class Polarization:
             )
 
     def compute(self, g_lesser: NDArray, g_greater: NDArray) -> None:
+        """Computes the transversal polarization using FFTs.
+
+        Parameters
+        ----------
+        g_lesser : NDArray
+            Lesser Green's function.
+        g_greater : NDArray
+            Greater Green's function.
+
+        Returns
+        -------
+        pi_lesser : NDArray
+            Lesser transversal polarization.
+        pi_greater : NDArray
+            Greater transversal polarization.
+
         """
-        Compute Π^(ω) using FFTs to turn the energy convolution into a time product.
 
-        G1:          (nE, N, N) complex
-        G2:          (nE, N, N) complex
+        print("Computing polarization...")
 
-        Returns:
-        p_polarization:         (Np, N, N, 3, 3) complex
-        """
-
-        print("Starting FFT based transversal polarization computation...")
-
-        Ne, Nk, N, _ = g_lesser.shape
-        n = Ne + Ne - 1  # padding
+        num_electron_energies, num_kpts, num_orbitals, __ = g_lesser.shape
+        # Determine the padding for the FFT.
+        n = num_electron_energies + num_electron_energies - 1
         print(" The padding for FFT is:", n)
 
         print("Starting FFT forward...")
         start_fft_timer = time.perf_counter()
-        # (Np,k-space, N, N)
-        g_lesser_fft = scipy.fft.fft(g_lesser, n, axis=0, workers=128)
-        # (Np,-kspace, N, N) 32 sec
-        g_greater_fft = scipy.fft.fft(g_greater, n, axis=0, workers=128)
+
+        g_lesser_fft = scipy.fft.fft((-g_lesser.conj())[::-1], n=n, axis=0, workers=128)
+        g_greater_fft = scipy.fft.fft(g_greater, n=n, axis=0, workers=128)
+
         end_fft_timer = time.perf_counter()
 
-        # np : 9.933s  | scipy : 9.911s
         print(f"FFT took {end_fft_timer - start_fft_timer:.3f}s")
 
-        # (Nl,N, N,3)
-        interaction_tensor = (
-            device.interaction_tensor_k.astype(xp.complex128, copy=False)
-        )[..., *device.inds_cc, :]
-        # erreur potentielle car interaction tensor N lattice pas k-space
-        print("Interaction tensor shape:", interaction_tensor.shape)
+        print("Interaction tensor shape:", device.interaction_tensor_k.shape)
         print("g_lesser_fft shape:", g_lesser_fft.shape)
         print("g_greater_fft shape:", g_greater_fft.shape)
 
-        print("Starting the big summation over k-points and contraction, BE PATIENT...")
+        print("Starting contraction...")
         start = time.perf_counter()
-        indices_list = [
+        contraction_subscripts = [
             "miu,tmj,jnv,tni->tmnuv",
             "miu,tmn,njv,tji->tmnuv",
             "miu,tij,jnv,tnm->tmnuv",
             "miu,tin,njv,tjm->tmnuv",
         ]
 
-        path_mem = []
-        for i in indices_list:
-            path, path_info = oe.contract_path(
-                i,
-                interaction_tensor[0, :, :, :],
-                g_lesser_fft[:, 0, :, :],
-                interaction_tensor[0, :, :, :],
+        contraction_paths = []
+        for subscripts in contraction_subscripts:
+            path, __ = oe.contract_path(
+                subscripts,
+                device.interaction_tensor_k[0, :, :, :],
                 g_greater_fft[:, 0, :, :],
+                device.interaction_tensor_k[0, :, :, :],
+                g_lesser_fft[:, 0, :, :],
                 optimize="optimal",
                 memory_limit="max_input",
             )
-            path_mem.append(path)
+            contraction_paths.append(path)
 
-        summation_terms = None
-        for i in indices_list:
-
-            for k in range(Nk):
-
-                # einsum look at it if more efficient
-                summation_over_k = None
-                # path, path_info = oe.contract_path(
-                #     i,
-                #     interaction_tensor[k,:,:,:],
-                #     g_lesser_fft[:, k, :, :],
-                #     interaction_tensor[k,:,:,:],
-                #     g_greater_fft[:, k, :, :],
-                #     optimize="optimal",
-                #     memory_limit="max_input",
-                # )
-                Term_k = oe.contract(
-                    i,
-                    interaction_tensor[k, :, :, :],
-                    g_lesser_fft[:, k, :, :],
-                    interaction_tensor[k, :, :, :],
-                    g_greater_fft[:, k, :, :],
-                    optimize=path_mem[indices_list.index(i)],
-                    memory_limit="max_input",
-                )  # (n, N, N, 3, 3)
-
-                if summation_over_k is None:
-                    summation_over_k = Term_k
-                else:
-                    summation_over_k += Term_k
-                del Term_k
-
-            if summation_terms is None:
-                summation_terms = summation_over_k
-            else:
-                summation_terms += summation_over_k
-
-            del summation_over_k
+        pi_greater_fft = xp.zeros(
+            (n, num_orbitals, num_orbitals, 3, 3), dtype=xp.complex128
+        )
+        for subscripts, path in zip(contraction_subscripts, contraction_paths):
+            for k_ind in range(num_kpts):
+                pi_greater_fft[:] += (
+                    oe.contract(
+                        subscripts,
+                        device.interaction_tensor_k[k_ind, :, :, :],
+                        g_greater_fft[:, k_ind, :, :],
+                        device.interaction_tensor_k[k_ind, :, :, :],
+                        g_lesser_fft[:, k_ind, :, :],
+                        optimize=path,
+                        memory_limit="max_input",
+                    )
+                    / num_kpts
+                )
 
         end = time.perf_counter()
-        # print(path_info)
-        print(end - start)
+        print(f"Contraction took {end - start:.3f}s")
 
         print("FFT back is starting...")
-        # FFT back:  tau -> omega
-        time_FFT_start = time.perf_counter()
-        Pi_omega_full = xp.fft.ifft(summation_terms, axis=0)  # (n, Nk, N, N, 3, 3)
-        Pi_omega_full = self.prefactor * Pi_omega_full
+
+        time_fft_start = time.perf_counter()
+        pi_greater_full = scipy.fft.ifft(pi_greater_fft, axis=0, workers=128)
+
         time_FFT_end = time.perf_counter()
-        print(
-            f"fft took {time_FFT_end - time_FFT_start:.3f}s"
-        )  # np: 0.591s | scipy : 0.595s
+        print(f"fft took {time_FFT_end - time_fft_start:.3f}s")
 
-        # index array
-        idx = xp.round(
-            (self.photon_energies - self.photon_energies[0]) / self.dE
-        ).astype(int)
+        # NOTE: Save full polarization for debugging.
+        density = xp.trace(
+            self.prefactor * pi_greater_full, axis1=-1, axis2=-2
+        ).diagonal(axis1=-1, axis2=-2)
+        xp.save("outputs/pi_lesser_full_density.npy", density)
 
-        if xp.any((idx < 0) | (idx >= Pi_omega_full.shape[0])):
-
-            bad = self.photon_energies[(idx < 0) | (idx >= Pi_omega_full.shape[0])]
-            raise ValueError(
-                f"Some requested photon energies fall outside the FFT grid: {bad}"
-            )
-
-        # select only those frequencies and corresponding polarization values
-        p_polarization_selected = Pi_omega_full[idx, ...]  # (Nw, N, N, 3, 3)
-
-        # --- detailed balance: Π^>(ω) = iΠ^<(-hbarω) ---
-        # reshape polarization (Nw,3,3,N,N) mit einops
-
-        print("you made it! poalarization runs")
-        pi_lesser = einops.rearrange(
-            p_polarization_selected,
-            "e m n u v -> e u v m n",
-        )  # (nw, 3, 3, N,N)
-
-        pi_greater = -xp.conj(pi_lesser[::-1])  # -pi(-w)
-
-        print(
-            "pi_lesser shape:", pi_lesser.shape, " pi_greater shape:", pi_greater.shape
+        pi_greater_full = self.prefactor * einops.rearrange(
+            pi_greater_full, "e m n u v -> e u v m n"
         )
+        pi_lesser_full = -pi_greater_full[::-1].conj()
+
+        # Slice out the relevant energy window.
+        start_ind = int(self.photon_energies[0] // self.dE)
+        stop_ind = start_ind + len(self.photon_energies)
+        num_electron_energies = self.electron_energies.shape[0]
+        energy_slice = slice(
+            -num_electron_energies + start_ind,
+            -num_electron_energies + stop_ind,
+        )
+
+        pi_lesser = pi_lesser_full[energy_slice]
+        pi_greater = pi_greater_full[energy_slice]
 
         return pi_lesser, pi_greater
