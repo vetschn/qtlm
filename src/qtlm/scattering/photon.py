@@ -1,203 +1,125 @@
 import time
 
-import einops
+import einops as eo
 import numpy as np
-from ase.dft import kpoints
 
 from qtlm import NDArray, linalg, xp
 from qtlm.config import QTLMConfig
 from qtlm.scattering.device import Device
+from qtlm.scattering.obc import sancho_rubio
 
 device = Device()
 
 
 class PhotonSolver:
+    """Solver for the optical subsystem."""
 
     def __init__(self, config: QTLMConfig):
-
+        """Initializes the photon solver."""
         self.config = config
 
         self.energies = config.photon.energies
-        self.num_energies = self.energies.size
+        self.num_energies = self.energies.shape[0]
+
         self.system_matrix = None
         self.b_lesser = None
         self.b_greater = None
 
+        d_0 = device.assemble_d_0(self.energies)
+        self.d_0 = eo.rearrange(d_0, "e m n i j -> e (i m) (j n)")
+        np.save(self.config.output_dir / "d_0.npy", self.d_0)
+
     def _assemble_system_matrix(self, pi_retarded: NDArray):
-        """Assembles the system matrix for the electron solver."""
-        # phases = xp.einsum("ik,jk->ij", device.kpts[kpt_slice], device.r_vectors)
+        """Assembles the optical system matrix.
 
-        D_initial = (device.compute_d0(self.energies))[
-            ..., *device.inds_cc
-        ]  # (nw,Nl, N, N)
+        This sets the system matrix attribute of the solver instance.
 
-        # Assemble system matrix: M = I-D0·Π^R
-        self.system_matrix = xp.broadcast_to(
-            xp.eye(device.num_orbitals, device.num_orbitals),
-            (self.num_energies, 3, 3, device.num_orbitals, device.num_orbitals),
+        Parameters
+        ----------
+        pi_retarded : NDArray
+            Retarded photon self-energy.
+
+        """
+        print("Assembling photon system matrix...")
+        time_start = time.perf_counter()
+        identity = np.broadcast_to(
+            np.eye(3 * device.num_orbitals, 3 * device.num_orbitals),
+            (self.num_energies, 3 * device.num_orbitals, 3 * device.num_orbitals),
         )
-        -xp.einsum("eij,emnjk->emnik", D_initial, pi_retarded)  # shape (nW, 3,3, N, N)
-        print("system matrix shape:", self.system_matrix.shape)
 
-        #  Assemble for the Term B_lesser and B_greater: B = (D0@deltaT) @ PI @ (D0@deltaT)^T
+        self.system_matrix = identity - self.d_0 @ pi_retarded
+        time_end = time.perf_counter()
+        print(f"Time to assemble photon system matrix: {time_end - time_start:.3f} s")
 
-    # def _assemble_b_terms(self, pi_lesser: NDArray, pi_greater: NDArray):
-    #     """Assembles the B terms for the photon solver."""
-    #     right_hand_side = (device.compute_d0_delta_perp(self.energies))[...,*device.inds_cc]  # (Nw, 3,3, N, N)
-
-    #     # Reshape polarization (Nw,3,3,N,N) mit einops
-    #     pi_lesser_reshaped = einops.rearrange(
-    #         pi_lesser,
-    #         "e m n u v -> e u v m n",
-    #     )  # (nw, 3, 3, N,N)
-
-    #     pi_greater_reshaped = einops.rearrange(
-    #         pi_greater,
-    #         "e m n u v -> e u v m n",
-    #     )  # (nw, 3, 3, N,N)
-    #     print("right hand side shape:", right_hand_side.shape, "pi_lesser_reshaped shape:", pi_lesser_reshaped.shape)
-    #     self.b_lesser = (
-    #         right_hand_side
-    #         @ pi_lesser_reshaped
-    #         @ right_hand_side.conj().swapaxes(-1,-2)
-    #     )# shape (nw, 3, 3, N, N)
-
-    #     self.b_greater = (
-    #         right_hand_side
-    #         @ pi_greater_reshaped
-    #         @ right_hand_side.conj().swapaxes(-1,-2)
-    #     ) # shape (nw, 3, 3, N, N)
+        np.save(
+            self.config.output_dir / "photon_system_matrix.npy",
+            self.system_matrix,
+        )
 
     def _compute_obc(self):
         """Computes the open boundary conditions."""
-        d_l = linalg.inv(self.system_matrix[..., *device.inds_ll])  #
-        d_r = linalg.inv(self.system_matrix[..., *device.inds_rr])
 
-        # # Left Contact OBC
-        # a_ll = self.system_matrix[..., *device.inds_ll] #00
-        # a_cl = self.system_matrix[..., *device.inds_cl] #10
-        # a_lc = self.system_matrix[..., *device.inds_lc] #01
+        pi_retarded_obc = xp.zeros_like(self.system_matrix)
 
-        # # Right Contact OBC
-        # a_rr = self.system_matrix[..., *device.inds_rr]
-        # a_rc = self.system_matrix[..., *device.inds_cr]
-        # a_cr = self.system_matrix[..., *device.inds_rc]
+        block_size = 3 * 32  # hardcoded for now, should be generalised
 
-        # OBC for Pi_retarded_obc:
+        a_ii = self.system_matrix[..., :block_size, :block_size]
+        a_ij = self.system_matrix[..., :block_size, block_size : 2 * block_size]
+        a_ji = self.system_matrix[..., block_size : 2 * block_size, :block_size]
+        x_l = sancho_rubio(a_ii, a_ij, a_ji)
 
-        # Left contact OBC
-        pi_retarded_l: NDArray = (
-            self.system_matrix[..., *device.inds_cl]
-            @ d_l
-            @ self.system_matrix[..., *device.inds_lc]
-        )
+        pi_retarded_l = a_ji @ x_l @ a_ij
+        pi_retarded_obc[..., :block_size, :block_size] = pi_retarded_l
 
-        # Right contact OBC
-        pi_retarded_r: NDArray = (
-            self.system_matrix[..., *device.inds_cr]
-            @ d_r
-            @ self.system_matrix[..., *device.inds_rc]
-        )
+        a_ii = self.system_matrix[..., -block_size:, -block_size:]
+        a_ij = self.system_matrix[..., -block_size:, -block_size * 2 : -block_size]
+        a_ji = self.system_matrix[..., -block_size * 2 : -block_size, -block_size:]
+        g_r = sancho_rubio(a_ii, a_ij, a_ji)
 
-        # OBC for Pi_retarded
-        pi_obc_retarded = pi_retarded_l + pi_retarded_r
+        pi_retarded_r = a_ji @ g_r @ a_ij
 
-        ## For now OBC for lesser and greater are neglected
-        # #OBC for pi_greater
-        # a_00_lesser_l = (
-        #     self.system_matrix[...,*device.inds_cl]
-        #     @ d_l
-        #     @ self.b_lesser[...,*device.inds_lc]
-        # )
-        # a_00_lesser_r = (
-        #     self.system_matrix[...,*device.inds_cr]
-        #     @ d_r
-        #     @ self.b_lesser[...,*device.inds_rc]
-        # )
+        pi_retarded_obc[..., -block_size:, -block_size:] = pi_retarded_r
 
-        # q_00_lesser_l = (
-        #     d_l
-        #     @(self.b_lesser[...,*device.inds_cl]-(a_00_lesser_l - a_00_lesser_l.conj().swapaxes(-1,-2))) #TODO
-        #     @d_l.conj().swapaxes(-1,-2)
-        # )
-        # q_00_lesser_r = (
-        #     d_r
-        #     @(self.b_lesser[...,*device.inds_cr]-(a_00_lesser_r - a_00_lesser_r.conj().swapaxes(-1,-2))) #TODO
-        #     @d_r.conj().swapaxes(-1,-2)
-        # )
-        # q_00_lesser = xp.stack((q_00_lesser_l,q_00_lesser_r))
+        return pi_retarded_obc
 
-        # pi_obc_lesser = q_00_lesser
+    def solve(self, pi_lesser: NDArray, pi_greater: NDArray):
+        """Solve for the photon Green's functions.
 
-        # #OBC for pi_greater
-        # a_00_greater_l = (
-        #     self.system_matrix[...,*device.inds_cl]
-        #     @ d_l
-        #     @ self.b_greater[...,*device.inds_lc]
-        # )
-        # a_00_greater_r = (
-        #     self.system_matrix[...,*device.inds_cr]
-        #     @ d_r
-        #     @ self.b_greater[...,*device.inds_rc]
-        # )
+        Parameters
+        ----------
+        pi_lesser : NDArray
+            Lesser photon self-energy.
+        pi_greater : NDArray
+            Greater photon self-energy.
 
-        # q_00_greater_l = (
-        #     d_l
-        #     @self.b_greater[...,*device.inds_cr]-(a_00_greater_l - a_00_greater_l.conj().swapaxes(-1,-2)) #TODO
-        #     @d_l.conj().swapaxes(-2,-1)
-        # )
-        # q_00_greater_r = (
-        #     d_r
-        #     @self.b_greater[...,*device.inds_cr]-(a_00_greater_r - a_00_greater_r.conj().swapaxes(-1,-2)) #TODO
-        #     @d_r.conj().swapaxes(-2,-1)
-        # )
-        # q_00_greater = xp.stack((q_00_greater_l,q_00_greater_r))
+        Returns
+        -------
+        d_lesser : NDArray
+            Lesser photon Green's function.
+        d_greater : NDArray
+            Greater photon Green's function.
 
-        # pi_obc_greater = q_00_greater
-        # gamma_r = 1j * (pi_retarded_r - pi_retarded_r.conj().swapaxes(-2, -1))
-        # gamma_l = 1j * (pi_retarded_l - pi_retarded_l.conj().swapaxes(-2, -1))
+        """
 
-        # sigma_lesser = (
-        #     1j * self.occupancies_r * gamma_r + 1j * self.occupancies_l * gamma_l
-        # )
+        pi_lesser = eo.rearrange(pi_lesser, "e m n i j -> e (i m) (j n)")
+        pi_greater = eo.rearrange(pi_greater, "e m n i j -> e (i m) (j n)")
 
-        # sigma_greater = (
-        #     1j * (1 - self.occupancies_r) * gamma_r
-        #     + 1j * (1 - self.occupancies_l) * gamma_l
-        # )
-
-        return pi_obc_retarded
-
-    def solve(
-        self,
-        pi_lesser: NDArray,
-        pi_greater: NDArray,
-    ):
-        """Main solver routine."""
         self._assemble_system_matrix((pi_greater - pi_lesser) / 2)
 
         pi_obc_retarded = self._compute_obc()
+        d_retarded = np.zeros_like(self.system_matrix)
 
         # Solve.
         print("Inverting photon system matrix...")
         time_start = time.perf_counter()
-        # may need to add compute_d0_delta_perp here
-        d_retarded = linalg.inv(
-            self.system_matrix[..., *device.inds_cc] - pi_obc_retarded
-        )
+        d_retarded = linalg.inv(self.system_matrix - pi_obc_retarded) @ self.d_0
         time_end = time.perf_counter()
         print(f"Time to invert photon system matrix: {time_end - time_start:.3f} s")
-        print(
-            "shape of d_retarded:",
-            d_retarded.shape,
-            "pi_lesser shape:",
-            pi_lesser.shape,
-            "d_retarded conj shape:",
-            d_retarded.conj().swapaxes(-2, -1).shape,
-        )
-        # photon lesser/greater Green's functions
-        # TODO: Include the delta_perp terms here
-        d_lesser = d_retarded @ (pi_lesser) @ d_retarded.conj().swapaxes(-2, -1)
-        d_greater = d_retarded @ (pi_greater) @ d_retarded.conj().swapaxes(-2, -1)
-        print("you made it! Photon Green's functions computed.")
+
+        d_lesser = d_retarded @ pi_lesser @ d_retarded.conj().swapaxes(-2, -1)
+        d_greater = d_retarded @ pi_greater @ d_retarded.conj().swapaxes(-2, -1)
+
+        d_lesser = eo.rearrange(d_lesser, "e (i m) (j n) -> e m n i j", m=3, n=3)
+        d_greater = eo.rearrange(d_greater, "e (i m) (j n) -> e m n i j", m=3, n=3)
+
         return d_lesser, d_greater
