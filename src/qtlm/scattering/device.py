@@ -1,12 +1,12 @@
-from qtlm.io import read_tight_binding_data
-from qtlm import NDArray, xp
-from ase.dft import kpoints
+import ase.io
 import numpy as np
 import opt_einsum as oe
-from qtlm.constants import hbar, c_0, e
+from ase.dft import kpoints
+
+from qtlm import NDArray, xp
 from qtlm.config import QTLMConfig
-import time
-import ase.io
+from qtlm.constants import c_0, hbar, mu_0
+from qtlm.io import read_tight_binding_data
 
 
 def linear_potential(v_at_pos_min: float, pos_min: float, pos_max: float) -> callable:
@@ -32,7 +32,6 @@ def linear_potential(v_at_pos_min: float, pos_min: float, pos_max: float) -> cal
         """Calculates the potential at a given position."""
         pos = np.where(pos < pos_min, pos_min, pos)
         pos = np.where(pos > pos_max, pos_max, pos)
-        # pot = v_at_pos_max * (pos - pos_min) / (pos_max - pos_min)
         pot = v_at_pos_min * (pos - pos_max) / (pos_min - pos_max)
         return pot
 
@@ -52,7 +51,14 @@ class Device:
         return cls._instance
 
     def configure(self, config: QTLMConfig):
-        """Configures the device by loading tight-binding data."""
+        """Configures the device by loading tight-binding data.
+
+        Parameters
+        ----------
+        config : QTLMConfig
+            The QTLM configuration.
+
+        """
         if self._is_configured:
             raise RuntimeError("Device is already configured.")
 
@@ -81,9 +87,6 @@ class Device:
         # NOTE: We don't REALLY need to store all distances in memory. Do we?
         self.distances_r = self._compute_distances()
 
-        # Precompute interaction tensor.
-        self.interaction_tensor_k = self._assemble_interaction_tensor_k()
-
         # Initialize transport axis.
         self.transport_axis = "xyz".index(config.device.transport_direction)
 
@@ -95,85 +98,167 @@ class Device:
         pos_axis = self.orbital_positions[:, self.transport_axis]
         pos_min = pos_axis.min()
         pos_max = pos_axis.max()
+
         Vmin = float(self.config.bias.bias_start)
         pot_fn = linear_potential(Vmin, pos_min, pos_max)
         self.potential = pot_fn(pos_axis)
+
+        # Initialize distance mask for photon interactions.
+        self.distance_mask = (
+            np.linalg.norm(self.distances_r[0], axis=-1)
+            < config.photon.interaction_cutoff
+        )        
+        #NEW
+        np.save(self.config.output_dir / "distance_mask.npy", self.distance_mask)
+        block_size = 52
+        if xp.any(self.distance_mask[2 * block_size :, :block_size]):
+            print(
+                "Warning: interaction cutoff may be too large.",
+                "Matrices will not be block-tridiagonal.",
+            )
+        
+        self.hamiltonian_r = self.hamiltonian_r * self.distance_mask
+        self.overlap_r = self.overlap_r * self.distance_mask
+
+        # Precompute interaction tensor.
+        self.interaction_tensor_k = self._assemble_interaction_tensor_k()
+        # zero interaction in left contact
+        self.interaction_tensor_k[:, : 20 * 13, : 20 * 13] = 0.0
+        # zero interaction in left contact
+        self.interaction_tensor_k[:, -20 * 13 :, -20 * 13 :] = 0.0
+
+        np.save(
+            self.config.output_dir / "interaction_tensor_k.npy",
+            self.interaction_tensor_k,
+        )
 
         # Mark as configured.
         self._is_configured = True
 
     def _compute_distances(self) -> NDArray:
-        """Returns the distance matrix between orbitals."""
+        """Returns the distance matrix between orbitals.
 
+        This is in Angstroms.
+
+        Returns
+        -------
+        distances : NDArray
+            The distance matrix between orbitals,
+
+        """
         distances_r = xp.zeros(
             (self.r_vectors.shape[0], self.num_orbitals, self.num_orbitals, 3)
         )  # (N_lattice in real space, Norb, Norb, 3)
-        for i, vec in enumerate(self.r_vectors):
+        for i, r_vec in enumerate(self.r_vectors):
             image_position = (
-                self.orbital_positions + vec @ self.lattice_vectors
+                self.orbital_positions + r_vec @ self.lattice_vectors
             )  # (Norb, Norb, 3)
             distances_r[i] = (
                 self.orbital_positions[:, np.newaxis] - image_position[np.newaxis, :]
             )
 
+        np.save(self.config.output_dir / "distances_r.npy", distances_r)
+
         return distances_r  # (Nlattice, Norb, Norb, 3) in Angstrom
 
     def _assemble_interaction_tensor_k(self) -> NDArray:
+        """Assembles the interaction tensor in k-space.
 
-        prefactor = (-e / 2.0) * (1j / (hbar))  # e
+        This is done by first computing the interaction tensor in real
+        space and then transforming it to k-space using a Fourier
+        transform.
+
+        Returns
+        -------
+        interaction_tensor_k : NDArray
+            The interaction tensor in k-space.
+
+        """
+        prefactor = 1  # (-e / 2.0) * (1j / (hbar))  # e
         interaction_tensor_r = (
-            prefactor * self.hamiltonian_r[..., np.newaxis] * self.distances_r
+            prefactor * self.hamiltonian_r[..., np.newaxis] * self.distances_r * 1e-10
         )  # (Nlattice, Norb, Norb, 3)  - Maybe not GPU friendly
 
-        # transform to k-space
+        # Transform to k-space
         phases = oe.contract("ik,jk->ij", self.kpts, self.r_vectors)
         phase_factors = xp.exp(2j * xp.pi * phases)
         interaction_tensor_k = oe.contract(
             "ij,jklm->iklm", phase_factors, interaction_tensor_r
         )
 
-        return interaction_tensor_k  # (Nk, Norb, Norb, 3) in eV Angstrom / s
+        return interaction_tensor_k.astype(
+            xp.complex128
+        )  # (Nk, Norb, Norb, 3) in eV Angstrom / s
 
+    def assemble_d_0(self, photon_energies: NDArray) -> NDArray:
+        """Assembles the bare vacuum photon Green's function.
 
-    def compute_d0(self, photon_energies):
+        The photons are only treated at the Gamma point. Thus, the
+        bare photon Green's function is given assembled in real space
+        and summed to the Brillouin zone Gamma point.
+
+        Parameters
+        ----------
+        photon_energies : NDArray
+            Array of photon energies in eV.
+
+        Returns
+        -------
+        d_0 : NDArray
+            The bare photon Green's function.
+
         """
-        Computes the non interaction response d_0.
-        d_0(r, ω) = exp(i k r) / (4 π r)
-
-        """
-        start = time.perf_counter()
         omega = photon_energies / hbar  # angular frequencies in rad/s
         k = omega / c_0  # wave vectors in 1/Å
 
         # Now there is the periodicity to consider, introduced via the distance_r
-        r_norm = xp.linalg.norm(self.distances_r, axis=-1)  # (Nlattice, Norb, Norb, 3)
+        r_norm = (
+            xp.linalg.norm(self.distances_r, axis=-1) * 1e-10
+        )  # (Nlattice, Norb, Norb, 3)
 
         # Mask of all position where distance is non zero - goal is to avoid division by zero
-        mask = r_norm > 0
-        r_safe = xp.where(mask, r_norm, 1.0)
-        # set 1 where zero to avoid division by zero
+        xp.fill_diagonal(r_norm[0], xp.inf)
 
-        d_images = (
-            xp.exp(1j * k[:, None, None, None] * r_safe[None, ...])
-            / (4 * xp.pi * r_safe[None, ...])
-        ) * mask[None, ...]
+        d_0_r = xp.exp(1j * k[:, None, None, None] * r_norm[None, ...]) / (
+            4 * xp.pi * r_norm[None, ...]
+        )
+        # set not a number in the diagonal tending zero
+        d_0_r = np.nan_to_num(d_0_r, posinf=0.0)
 
-        # Sum over images → gives periodic D0 (periodicity is made in real space)
-        d_0 = d_images.sum(axis=1)
-        end = time.perf_counter()
-        print(f"- time compute non interaction response d_0 : {end - start:.3f} seconds")
+        # mask = r_norm > 0
+        # r_safe = xp.where(mask, r_norm, 1.0)
+        # # set 1 where zero to avoid division by zero
 
-        return d_0  # shape (Nw, Norb, Norb) in 1/ Å
+        # d_images = (
+        #     xp.exp(1j * k[:, None, None, None] * r_safe[None, ...])
+        #     / (4 * xp.pi * r_safe[None, ...])
+        # ) * mask[None, ...]
 
-    def compute_transversal_delta(self):
+        temp = d_0_r.sum(axis=1) / self.num_kpts
+        temp = temp * self.distance_mask
+
+        d_0 = np.zeros(
+            (photon_energies.shape[0], 3, 3, self.num_orbitals, self.num_orbitals),
+            dtype=complex,
+        )
+        # Insert into diagonal components.
+        for i in range(3):
+            d_0[:, i, i, :, :] = temp
+
+        # # Sum over images → gives periodic D0 (periodicity is made in real space)
+        # d_0 = d_images.sum(axis=1)
+
+        return d_0 * mu_0  # shape (Nw, Norb, Norb) in 1/ Å
+
+    def compute_transversal_delta_r(self):
         """
         Computes the transverse delta function δ⊥ needed for the photon green function calculation.
 
-            δ⊥_{ij}(r) = δ_{ij} δ^{(3)}(r)  +  (1/4π) * [ 3 r_i r_j / r^5  - δ_{ij} * r^2 / r^5 ]
+            δ⊥_{ij}(r) = δ_{ij} δ^{(3)}(r-r')  +  (1/4π) * [ 3 (r_i-r'_i) (r_j - r'_j) / |r-r'|^5  - δ_{ij} * |r-r'|^2 / |r-r'|^5 ]
 
-            where δ^{(3)}(r) is approximated by a 3D Gaussian with small width.
+            where δ^{(3)}(|r-r'|) is approximated by a 3D Gaussian with small width.
         """
-        time_start = time.perf_counter()
+
         sigma = 1e-10
         pref = 1.0 / (4.0 * xp.pi)
 
@@ -203,9 +288,44 @@ class Device:
                 )
 
         delta_perp = delta_image.sum(axis=0)  # sum over lattice images
-        time_end = time.perf_counter()
-        print(f"- time to compute transversal delta function : {time_end - time_start:.3f} s")
         return delta_perp  # (3, 3, Norb, Norb)
+    def compute_transverse_delta_k(self) -> NDArray:
+        """
+        Computes the transverse delta function δ⊥ in k-space needed for the photon green function calculation.
+
+            δ⊥_{ij}(k) = δ_{ij}  - k_i k_j / |k|^2
+
+        Returns
+        -------
+        NDArray
+            The transverse delta function in k-space, shape (3, 3, Norb, Norb)
+        """
+        A = xp.array(self.lattice_vectors, dtype=float)          # (3,3) Å
+        B = 2.0 * xp.pi * xp.linalg.inv(A).T                     # (3,3) 1/Å
+
+        # --- k-vectors in cartesian coordinates (1/Å)
+        kvec = self.kpts @ B                                     # (Nk,3)
+
+        # --- build transverse projector
+        k2 = xp.sum(kvec**2, axis=-1, keepdims=True)             # (Nk,1)
+        inv_k2 = 1.0 / (k2 + eps)                                # (Nk,1)
+
+        kkT = kvec[..., :, None] * kvec[..., None, :]            # (Nk,3,3)
+
+        I = xp.eye(3, dtype=kvec.dtype)[None, :, :]              # (1,3,3)
+        delta_perp_k = I - kkT * inv_k2[..., None]  
+        # for u in range(3):
+        #     for v in range(3):
+        #         delta_ij = 1.0 if u == v else 0.0
+        #         k_u = self.kpts[:, u][:, None, None]  # (Nk, 1, 1)
+        #         k_v = self.kpts[:, v][:, None, None]  # (Nk, 1, 1)
+        #         k_squared = xp.sum(self.kpts**2, axis=1)[:, None, None]  # (Nk, 1, 1)
+
+        #         delta_perp_k[u, v, :, :] = xp.mean(
+        #             delta_ij - (k_u * k_v) / (k_squared + 1e-20), axis=0
+        #         )  # avoid division by zero
+
+        return delta_perp_k  # (3, 3, Norb, Norb)
 
     def _init_contacts(self):
         """Initializes the indices for the contact regions."""

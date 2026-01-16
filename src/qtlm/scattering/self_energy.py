@@ -1,38 +1,40 @@
 import time
 
-import scipy
-import opt_einsum as oe
 import einops
+import opt_einsum as oe
+import scipy
 
 from qtlm import NDArray, xp
-
-from qtlm.constants import mu_0
 from qtlm.config import QTLMConfig
-
 from qtlm.scattering.device import Device
 
 device = Device()
 
 
 class SelfEnergy:
-    """
-    Photon self-energy.
+    """Calculator for the transversal photon self-energy.
+
+    Parameters
+    ----------
+    config : QTLMConfig
+        Configuration object.
+
     """
 
     def __init__(self, config: QTLMConfig) -> None:
-        """
-        Initialize the Self-Energy solver.
-        config: QTLMConfig
-        """
+        """Initializes the SelfEnergy calculator."""
 
         # grids
         self.electron_energies = config.electron.energies
         self.photon_energies = config.photon.energies
 
-        self.prefactor = 1j * mu_0 * (1 / (2 * xp.pi))
         self.dE = xp.abs(self.electron_energies[1] - self.electron_energies[0])
         self.dhw = xp.abs(self.photon_energies[1] - self.photon_energies[0])
 
+        self.prefactor = 1j / (2 * xp.pi) * self.dE
+
+        # Check that the energy grids are uniformly spaced and
+        # commensurate.
         if not xp.allclose(
             xp.diff(self.electron_energies), self.dE, rtol=1e-6, atol=1e-12
         ):
@@ -48,102 +50,161 @@ class SelfEnergy:
                 f"Mismatch in spacing : Δω={self.dhw:.3e} vs ΔEs={self.dE:.3e}"
             )
 
-        self.path_mem = []
-        self.first_iteration = True
 
     def compute(
         self,
-        g_electron: NDArray,
-        d_photon: NDArray,
+        g_lesser: NDArray,
+        g_greater: NDArray,
+        d_lesser: NDArray,
+        d_greater: NDArray,
     ) -> None:
-        """Compute the photon self-energy Σ.
+        """Computes the transversal photon self-energy using FFTs.
 
-        Args:
-          g_electron:        (Ne, Norb, Norb) complex
-          d_photon:          (Nw, 3, 3, Norb, Norb) complex
-        Returns:
-          sigma_self_energy: (Ne, Norb, Norb, 3, 3) complex
+        Parameters
+        ----------
+        g_lesser : NDArray
+            Lesser electron Green's function.
+        g_greater : NDArray
+            Greater electron Green's function.
+        d_lesser : NDArray
+            Lesser photon Green's function.
+        d_greater : NDArray
+            Greater photon Green's function.
+
+        Returns
+        -------
+        sigma_lesser : NDArray
+            Lesser transversal self-energy.
+        sigma_greater : NDArray
+            Greater transversal self-energy.
+
         """
-        # Rearrange d_photon for contraction
-        d__photon_reshaped = einops.rearrange(
-            d_photon, "e m n u v -> e u v m n"
-        )  # (Nw, 3, 3, Norb, Norb)
+        
+        print("- Starting FFT based transversal self-energy computation...")
+        num_photon_energies = d_lesser.shape[0]
+        num_electron_energies, num_kpts, *__ = g_lesser.shape
 
-        Ne, Nk, _, _ = g_electron.shape
-        Nw = d_photon.shape[0]
-        Np = Nw + Ne - 1  # padding
+        # Determine the padding for the FFT.
+        n = num_photon_energies + num_electron_energies - 1
+
+        # Rearrange d_lesser/d_greater for FFT
+        d_lesser_reshaped = einops.rearrange(d_lesser, "e m n u v -> e u v m n")
+        d_greater_reshaped = einops.rearrange(d_greater, "e m n u v -> e u v m n")
 
         # FFT: energy/frequency domain to time domain: energy -> tau
-        g_electron_fft_unflipped = scipy.fft.fft(g_electron, Np, axis=0, workers=128)
-        g_electron_fft = xp.conj(g_electron_fft_unflipped[::-1])  # (Np, Norb, Norb)
-        d_photon_fft = scipy.fft.fft(
-            d__photon_reshaped, Np, axis=0, workers=128
-        )  # (Np, Norb, Norb, 3, 3)
-
-        interaction_tensor_k = (
-            device.interaction_tensor_k.astype(xp.complex128, copy=False)
-        )[
-            ..., *device.inds_cc, :
-        ]  # (Nk, Norb, Norb, 3)
-
+        start_fft_timer = time.perf_counter()
+        g_lesser_fft = scipy.fft.fft(g_lesser, n, axis=0, workers=128)
+        g_greater_fft = scipy.fft.fft(g_greater, n, axis=0, workers=128)
+        d_lesser_fft = scipy.fft.fft(d_lesser_reshaped, n, axis=0, workers=128)
+        d_greater_fft = scipy.fft.fft(d_greater_reshaped, n, axis=0, workers=128)
+        end_fft_timer = time.perf_counter()
+        print(f"  time for the FFT foward: {end_fft_timer - start_fft_timer:.3f}s")
+        
         # Get the term for the transverse self-energy
-        print("-> Patience Requested: Starting contraction ...")
-
+        print("- Patience Requested: Starting contraction ...")
         start_einsum_timer = time.perf_counter()
-        indices_list = [
+        contraction_subscripts = [
             "iju,til,lkv,tikuv->tjk",
             "iju,til,lkv,tiluv->tjk",
             "iju,til,lkv,tjkuv->tjk",
             "iju,til,lkv,tjluv->tjk",
         ]
-        # NOTE: Könnte ich das nicht nur einmal machen bei der erste iteration - initialisation ?
-        if self.first_iteration:
+        contraction_paths = []
+        for subscripts in contraction_subscripts:
+            path, __ = oe.contract_path(
+                subscripts,
+                device.interaction_tensor_k[0, ...],
+                g_lesser_fft[:, 0, ...],
+                device.interaction_tensor_k[0, ...],
+                d_lesser_fft,
+                optimize="optimal",
+                memory_limit="max_input",
+            )
+            contraction_paths.append(path)
 
-            for i in indices_list:
-                path, _ = oe.contract_path(
-                    i,
-                    interaction_tensor_k[0, ...],
-                    g_electron_fft[:, 0, ...],
-                    interaction_tensor_k[0, ...],
-                    d_photon_fft,
-                    optimize="optimal",
+        sigma_lesser_fft = xp.zeros_like(g_lesser_fft)
+        sigma_greater_fft = xp.zeros_like(g_greater_fft)
+
+        for subscripts, path in zip(contraction_subscripts, contraction_paths):
+            for k_ind in range(num_kpts):
+                sigma_lesser_fft[:, k_ind] += oe.contract(
+                    subscripts,
+                    device.interaction_tensor_k[k_ind, ...],
+                    g_lesser_fft[:, k_ind, ...],
+                    device.interaction_tensor_k[k_ind, ...],
+                    d_lesser_fft,
+                    optimize=path,
                     memory_limit="max_input",
                 )
-                self.path_mem.append(path)
-
-            self.first_iteration = False
-
-        summation_terms = xp.zeros_like(g_electron_fft)
-
-        for i in indices_list:
-
-            for k in range(Nk):
-                # with mutable summation_terms more efficient / elegant
-                summation_terms[:, k] = oe.contract(
-                    i,
-                    interaction_tensor_k[k, ...],
-                    g_electron_fft[:, k, ...],
-                    interaction_tensor_k[k, ...],
-                    d_photon_fft,
-                    optimize=self.path_mem[indices_list.index(i)],
+                sigma_lesser_fft[:, k_ind] -= oe.contract(
+                    subscripts,
+                    device.interaction_tensor_k[k_ind, ...],
+                    g_lesser_fft[:, k_ind, ...],
+                    device.interaction_tensor_k[k_ind, ...],
+                    d_greater_fft.conj(),
+                    optimize=path,
+                    memory_limit="max_input",
+                )
+                sigma_greater_fft[:, k_ind] += oe.contract(
+                    subscripts,
+                    device.interaction_tensor_k[k_ind, ...],
+                    g_greater_fft[:, k_ind, ...],
+                    device.interaction_tensor_k[k_ind, ...],
+                    d_greater_fft,
+                    optimize=path,
+                    memory_limit="max_input",
+                )
+                sigma_greater_fft[:, k_ind] -= oe.contract(
+                    subscripts,
+                    device.interaction_tensor_k[k_ind, ...],
+                    g_greater_fft[:, k_ind, ...],
+                    device.interaction_tensor_k[k_ind, ...],
+                    d_lesser_fft.conj(),
+                    optimize=path,
                     memory_limit="max_input",
                 )
 
         end_einsum_timer = time.perf_counter()
-        print(f"- time for summation : {end_einsum_timer - start_einsum_timer:.3f}s")
+        print(f"  time for contraction : {end_einsum_timer - start_einsum_timer:.3f}s")
 
-        sigma_full = self.prefactor * scipy.fft.ifft(
-            summation_terms, axis=0, workers=128
-        )  # (Np, Norb, Norb, 3, 3)
+        # FFT back: tau -> omega
+        print("- FFT back is starting...")
+        start_time_fft = time.perf_counter()
+        sigma_lesser_full = scipy.fft.ifft(sigma_lesser_fft, axis=0, workers=128)
+        sigma_greater_full = scipy.fft.ifft(sigma_greater_fft, axis=0, workers=128)
+        end_time_fft = time.perf_counter()
+        print(f"  time for the back FFT back: {end_time_fft - start_time_fft:.3f}s")
 
-        # select only selected electron energies and corresponding polarization values
-        idx = xp.floor(
-            (self.electron_energies - self.electron_energies[0]) / self.dhw
-        ).astype(int)
+        # NOTE: Save full self-energy for debugging.
+        density = (self.prefactor * sigma_lesser_full)[:, 0].diagonal(
+            axis1=-1, axis2=-2
+        )
+        xp.save("outputs/sigma_full_density.npy", density)
 
-        if xp.any((idx < 0) | (idx >= Np)):
-            raise ValueError(f"Some requested energies fall outside the FFT grid.")
+        sigma_lesser_full = self.prefactor * sigma_lesser_full
+        sigma_greater_full = self.prefactor * sigma_greater_full
 
-        sigma_selected = sigma_full[idx, ...]
+        sigma_lesser = sigma_lesser_full[:num_electron_energies]
+        sigma_greater = sigma_greater_full[:num_electron_energies]
+        # TODO: Hardcoded block size should be removed later.
+        block_size = 52
+        sigma_lesser[..., :block_size, :block_size] = sigma_lesser[
+            ..., block_size : 2 * block_size, block_size : 2 * block_size
+        ]
+        sigma_lesser[..., -block_size:, -block_size:] = sigma_lesser[
+            ..., -2 * block_size : -block_size, -2 * block_size : -block_size
+        ]
+        sigma_greater[..., :block_size, :block_size] = sigma_greater[
+            ..., block_size : 2 * block_size, block_size : 2 * block_size
+        ]
+        sigma_greater[..., -block_size:, -block_size:] = sigma_greater[
+            ..., -2 * block_size : -block_size, -2 * block_size : -block_size
+        ]
 
-        return sigma_selected  # (Ne, Nk, Norb, Norb) in eV
+        sigma_greater.real = 0
+        sigma_lesser.real = 0
+
+        sigma_lesser = sigma_lesser - sigma_lesser.swapaxes(-2, -1).conj()
+        sigma_greater = sigma_greater - sigma_greater.swapaxes(-2, -1).conj()
+
+        return sigma_lesser, sigma_greater
