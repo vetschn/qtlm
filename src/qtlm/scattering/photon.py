@@ -24,11 +24,11 @@ class PhotonSolver:
         self.b_lesser = None
         self.b_greater = None
 
-        d_0 = device.assemble_d_0(self.energies)
-        self.d_0 = eo.rearrange(d_0, "e m n i j -> e (i m) (j n)")
+        self.d_0_alldim = device.assemble_d_0(self.energies)
+        self.d_0 = eo.rearrange(self.d_0_alldim, "e m n i j -> e (i m) (j n)")
         np.save(self.config.output_dir / "d_0.npy", self.d_0)
-        
-        self.delta_perp = None  # to be set later if needed
+        self.delta_perp = device.compute_transversal_delta_r()
+
 
 
     def _assemble_system_matrix(self, pi_retarded: NDArray):
@@ -90,6 +90,8 @@ class PhotonSolver:
 
         end_obc_timer = time.perf_counter()
         print(f"  time to compute photon OBC: {end_obc_timer - start_obc_timer:.3f} s")
+        
+        xp.save(self.config.output_dir / "pi_retarded_obc.npy", pi_retarded_obc)
 
         return pi_retarded_obc
 
@@ -105,15 +107,17 @@ class PhotonSolver:
             δ⊥: shape (3, 3, Norb, Norb) in 1/Amstrong^3
         """
         start_einsum_timer = time.perf_counter()
-        prod = xp.einsum(
-            "wij,uvjk->wuvik", self.d_0, self.delta_perp
-        )  # shape (Nw, 3, 3, Norb, Norb)
+        prod = np.einsum("wuvij,uvij->wuvij", self.d_0_alldim, self.delta_perp)
+        # shape (Nw, 3, 3, Norb, Norb)
         end_einsum_timer = time.perf_counter()
         print(
             f"  time to compute matrix multiplication between d_0 and delta transversal : {end_einsum_timer - start_einsum_timer:.3f}s"
         )
-        print("  prod shape:", prod.shape)
-        return prod  # (Nw, 3, 3, Norb, Norb)
+        np.save(self.config.output_dir / "d0_delta_perp.npy", prod)
+        print(" prod shape:", prod.shape)
+        prod_reareranged = eo.rearrange(prod, "w m n i j -> w (i m) (j n)")
+
+        return prod_reareranged # (Nw, 3*Norb, 3*Norb)
 
     def solve(
         self,
@@ -141,7 +145,7 @@ class PhotonSolver:
         pi_lesser = eo.rearrange(pi_lesser, "e m n i j -> e (i m) (j n)")
         pi_greater = eo.rearrange(pi_greater, "e m n i j -> e (i m) (j n)")
         
-        d_product = self.d_0 #self.compute_d0_delta_perp()  # shape (Nw, 3, 3, Norb, Norb) 
+        d_product = self.compute_d0_delta_perp()  # shape (Nw, 3*Norb, 3*Norb) 
 
         self._assemble_system_matrix((pi_greater - pi_lesser) / 2)
        
@@ -155,19 +159,19 @@ class PhotonSolver:
         end_inversion_timer = time.perf_counter()
         print(f"  time to invert photon system matrix: {end_inversion_timer - start_inversion_timer:.3f} s")
 
-        # photon lesser/greater Green's functions
+        # Photon lesser/greater Green's functions
         d_lesser = (
             d_retarded
-            #@ d_product
+            @ d_product
             @ pi_lesser
-            #@ d_product.conj().swapaxes(-2, -1)
+            @ d_product.conj().swapaxes(-2, -1)
             @ d_retarded.conj().swapaxes(-2, -1)
         )
         d_greater = (
             d_retarded
-            #@ d_product
+            @ d_product
             @ pi_greater
-            #@ d_product.conj().swapaxes(-2, -1)
+            @ d_product.conj().swapaxes(-2, -1)
             @ d_retarded.conj().swapaxes(-2, -1)
         )
 
@@ -203,4 +207,4 @@ class PhotonSolver:
         d_lesser = d_lesser * device.distance_mask
         d_greater = d_greater * device.distance_mask
 
-        return d_lesser, d_greater  # shape (Nw, 3, 3, Norb, Norb)
+        return d_lesser, d_greater  # (Nw, 3, 3, Norb, Norb)

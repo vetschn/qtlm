@@ -21,9 +21,9 @@ class ElectronSolver:
         self.energies = config.electron.energies
         self.system_matrix = None
 
-        # phi : bias points (is an array - idea : we will run the program for all of them
-        phi = 0.7 #config.bias.bias_stop
-
+        # phi : bias points (is an array - idea :run the program for all of them
+        phi = 0 
+        
         # NOTE: Left contact has the potential drop.
         self.occupancies_l = fermi_dirac(
             self.energies - config.electron.fermi_level - phi,
@@ -155,7 +155,14 @@ class ElectronSolver:
         sigma_retarded = (sigma_greater - sigma_lesser) / 2
         self._assemble_system_matrix(sigma_retarded)
         sigma_obc_lesser, sigma_obc_greater, sigma_obc_retarded = self._compute_obc()
-
+        xp.save(
+            self.config.output_dir / f"sigma_obc_lesser.npy",
+            sigma_obc_lesser,
+        )
+        xp.save(
+            self.config.output_dir / f"sigma_obc_greater.npy",
+            sigma_obc_greater,
+        )   
         g_retarded = np.zeros_like(sigma_retarded)
 
         # Solve

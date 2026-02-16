@@ -33,8 +33,7 @@ class SelfEnergy:
 
         self.prefactor = 1j / (2 * xp.pi) * self.dE
 
-        # Check that the energy grids are uniformly spaced and
-        # commensurate.
+        # Check that the energy grids are uniformly spaced and commensurate.
         if not xp.allclose(
             xp.diff(self.electron_energies), self.dE, rtol=1e-6, atol=1e-12
         ):
@@ -91,7 +90,7 @@ class SelfEnergy:
         d_lesser_reshaped = einops.rearrange(d_lesser, "e m n u v -> e u v m n")
         d_greater_reshaped = einops.rearrange(d_greater, "e m n u v -> e u v m n")
 
-        # FFT: energy/frequency domain to time domain: energy -> tau
+        # FFT: energy/frequency domain to time domain: energy -> time
         start_fft_timer = time.perf_counter()
         g_lesser_fft = scipy.fft.fft(g_lesser, n, axis=0, workers=128)
         g_greater_fft = scipy.fft.fft(g_greater, n, axis=0, workers=128)
@@ -186,6 +185,7 @@ class SelfEnergy:
 
         sigma_lesser = sigma_lesser_full[:num_electron_energies]
         sigma_greater = sigma_greater_full[:num_electron_energies]
+        
         # TODO: Hardcoded block size should be removed later.
         block_size = 52
         sigma_lesser[..., :block_size, :block_size] = sigma_lesser[

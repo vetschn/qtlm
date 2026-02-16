@@ -30,7 +30,7 @@ class Polarization:
     ) -> None:
         """Initializes the Polarization calculator."""
         
-        # grids
+        # Grids
         self.electron_energies = config.electron.energies
         self.photon_energies = config.photon.energies
 
@@ -39,8 +39,7 @@ class Polarization:
 
         self.prefactor = -1j / xp.pi * self.dE
         
-        # Check that the energy grids are uniformly spaced and
-        # commensurate.
+        # Check that the energy grids are uniformly spaced and commensurate.
         if not xp.allclose(
             xp.diff(self.electron_energies), self.dE, rtol=1e-6, atol=1e-12
         ):
@@ -80,7 +79,7 @@ class Polarization:
 
         # Determine the padding for the FFT.
         n = num_electron_energies + num_electron_energies - 1
-        print(" the padding for FFT is:", n)
+        print("- the padding for FFT is:", n)
 
         print("- Starting FFT forward...")
         start_fft_timer = time.perf_counter()
@@ -94,8 +93,8 @@ class Polarization:
         )
         start_sum_timer = time.perf_counter()
         contraction_subscripts = [
-            "miu,tmj,jnv,tni->tmnuv",
-            "miu,tmn,njv,tji->tmnuv",
+            "imu,tmj,jnv,tni->tmnuv",
+            "imu,tmn,njv,tji->tmnuv",
             "miu,tij,jnv,tnm->tmnuv",
             "miu,tin,njv,tjm->tmnuv",
         ]
@@ -141,7 +140,7 @@ class Polarization:
         start_time_fft = time.perf_counter()
         pi_greater_full = scipy.fft.ifft(pi_greater_fft, axis=0, workers=128)
         end_time_fft = time.perf_counter()
-        print(f"  time for fft took {end_time_fft - start_time_fft:.3f}s")
+        print(f"  time for FFT back: {end_time_fft - start_time_fft:.3f}s")
         
         # NOTE: Save full polarization for debugging.
         density = xp.trace(
@@ -187,4 +186,4 @@ class Polarization:
         pi_lesser = pi_lesser - pi_lesser.swapaxes(-2, -1).conj()
         pi_greater = pi_greater - pi_greater.swapaxes(-2, -1).conj()
 
-        return pi_lesser, pi_greater # (num_photon_energies, num_orbitals, num_orbitals, 3, 3)
+        return pi_lesser, pi_greater # (Nw, Norb, Norb, 3, 3) 
