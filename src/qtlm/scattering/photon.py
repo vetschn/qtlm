@@ -1,10 +1,6 @@
-import numpy as np
-from ase.dft import kpoints
-
 from qtlm import NDArray, linalg, xp
 from qtlm.config import PhotonConfig
 from qtlm.scattering.device import Device
-from qtlm.statistics import fermi_dirac
 
 device = Device()
 

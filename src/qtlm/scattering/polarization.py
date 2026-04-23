@@ -1,12 +1,10 @@
 import time
 
 import opt_einsum as oe
-import scipy
-import scipy.sparse as sp
 
 from qtlm import NDArray, xp
 from qtlm.config import QTLMConfig
-from qtlm.constants import hbar, mu_0
+from qtlm.constants import mu_0
 from qtlm.scattering.device import Device
 
 device = Device()

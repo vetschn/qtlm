@@ -1,4 +1,5 @@
 import numpy as np
+import opt_einsum as oe
 import scipy.sparse as sp
 from ase.dft import kpoints
 

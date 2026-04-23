@@ -1,5 +1,4 @@
 import numpy as np
-from ase.dft import kpoints
 
 from qtlm import NDArray, linalg, xp
 from qtlm.config import ElectronConfig
@@ -17,6 +16,7 @@ class ElectronSolver:
         self.system_matrix = None
 
         # TODO: bias setting in config
+        phi = 0.1  # eV, potential drop across the device
 
         # Left contact has the potential drop.
         self.occupancies_l = fermi_dirac(
