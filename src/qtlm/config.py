@@ -3,6 +3,7 @@ import tomllib
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -15,7 +16,6 @@ from pydantic import (
 from typing_extensions import Self
 
 from qtlm import xp
-import numpy as np
 
 _default_num_orbitals_per_atom = {
     "C": 13,
@@ -25,6 +25,7 @@ _default_num_orbitals_per_atom = {
     "Se": 13,
     "W": 29,
     "Mo": 29,
+    "Ag": 27,
 }
 
 
@@ -102,6 +103,7 @@ class ElectronConfig(BaseModel):
         self.kpt_grid = tuple(self.kpt_grid)
         return self
 
+
 class PhotonConfig(BaseModel):
     """Options for the photon subsystem solver."""
 
@@ -111,7 +113,6 @@ class PhotonConfig(BaseModel):
     energy_stop: PositiveFloat
     energy_window_num: PositiveInt | None = None
     energy_step: float | None = None
-
 
     energy_batch_size: PositiveInt = 128
 
@@ -166,13 +167,18 @@ class DeviceConfig(BaseModel):
     left_contact_region: tuple[float, float]
     right_contact_region: tuple[float, float]
 
+    left_contact_type: Literal["finite", "semi-infinite"] = "finite"
+    right_contact_type: Literal["finite", "semi-infinite"] = "finite"
+
+    potential_drop_region: tuple[float, float] | Literal["auto"] = "auto"
+
     transport_direction: Literal["x", "y", "z"]
 
     num_orbitals_per_atom: dict[str, int] = Field(
         default_factory=lambda: _default_num_orbitals_per_atom
     )
 
-    capacitor_model : Literal["none", "graphene"] = "none"
+    capacitor_model: Literal["none", "graphene"] = "none"
     graphene_capacitor: GrapheneCapacitorConfig = GrapheneCapacitorConfig()
 
     @model_validator(mode="after")
@@ -180,6 +186,7 @@ class DeviceConfig(BaseModel):
         """Transforms list to tuple."""
         self.left_contact_region = tuple(self.left_contact_region)
         self.right_contact_region = tuple(self.right_contact_region)
+        self.potential_drop_region = tuple(self.potential_drop_region)
         return self
 
 

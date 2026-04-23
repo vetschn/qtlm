@@ -1,4 +1,4 @@
-from qtlm import NDArray, xp, linalg
+from qtlm import NDArray, linalg, xp
 
 
 def sancho_rubio(
@@ -42,7 +42,6 @@ def sancho_rubio(
     alpha = a_ji.copy()
     beta = a_ij.copy()
 
-    delta = float("inf")
     for __ in range(max_iterations):
         inverse = linalg.inv(epsilon)
 

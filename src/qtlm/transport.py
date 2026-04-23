@@ -1,17 +1,18 @@
 import time
 
-from ase.dft import kpoints
 import numpy as np
+from ase.dft import kpoints
 from mpi4py.MPI import COMM_WORLD as comm
 from mpi4py.util import pkl5
 
-from qtlm import NDArray, xp, linalg
-from qtlm.config import QTLMConfig
-from qtlm.io import read_tight_binding_data
-from qtlm.gpu import free_mempool
-from qtlm.statistics import fermi_dirac
+from qtlm import NDArray, linalg, xp
 from qtlm.capacitor import compute_capacitor_potentials
+from qtlm.config import QTLMConfig
 from qtlm.constants import epsilon_0
+from qtlm.gpu import free_mempool
+from qtlm.io import read_tight_binding_data
+from qtlm.obc import sancho_rubio
+from qtlm.statistics import fermi_dirac
 
 if xp.__name__ == "cupy":
     import cupyx as cpx
@@ -248,7 +249,7 @@ class TransportSolver:
 
             def _compute_potentials(bias_voltage: float) -> NDArray:
                 """Returns a zero potential for the capacitor model."""
-                return 0, bias_voltage, bias_voltage
+                return 0, 0, bias_voltage
 
         elif self.config.device.capacitor_model == "graphene":
             if comm.rank == 0:
@@ -324,30 +325,6 @@ class TransportSolver:
         potential = self.potential.reshape(1, -1)
         potential = 0.5 * (s_k * potential + s_k * potential.T)
 
-        # Open boundary conditions.
-        system_matrix_l = (
-            xp.einsum(
-                "i,jkl->ijkl",
-                (self.energies[energy_slice] + 1j * self.config.electron.eta_contact),
-                s_k[..., *self.inds_ll],
-            )
-            - h_k[..., *self.inds_ll]
-            + potential[..., *self.inds_ll]
-        )
-        g_l = linalg.inv(system_matrix_l)
-
-        system_matrix_r = (
-            xp.einsum(
-                "i,jkl->ijkl",
-                (self.energies[energy_slice] + 1j * self.config.electron.eta_contact),
-                s_k[..., *self.inds_rr],
-            )
-            - h_k[..., *self.inds_rr]
-            + potential[..., *self.inds_rr]
-        )
-        g_r = linalg.inv(system_matrix_r)
-
-        # Central region.
         system_matrix = (
             xp.einsum(
                 "i,jkl->ijkl",
@@ -358,6 +335,71 @@ class TransportSolver:
             + potential
         )
 
+        # Open boundary conditions.
+        if self.config.device.left_contact_type == "finite":
+            system_matrix_l = system_matrix[..., *self.inds_ll]
+
+            # Add a small imaginary part.
+            system_matrix_l += (
+                1j * self.config.electron.eta_contact * s_k[..., *self.inds_ll]
+            )
+            g_l = linalg.inv(system_matrix_l)
+
+        elif self.config.device.left_contact_type == "semi-infinite":
+            # Use the Sancho-Rubio method to compute the surface Green's
+            # function for the left contact.
+            block_size = self.inds_l.size
+            g_l = sancho_rubio(
+                system_matrix[..., *self.inds_ll]
+                + 1j * self.config.electron.eta_contact * s_k[..., *self.inds_ll],
+                (
+                    system_matrix[..., *self.inds_lc]
+                    + 1j * self.config.electron.eta_contact * s_k[..., *self.inds_lc]
+                )[..., :, :block_size],
+                (
+                    system_matrix[..., *self.inds_cl]
+                    + 1j * self.config.electron.eta_contact * s_k[..., *self.inds_cl]
+                )[..., :block_size, :],
+            )
+        else:
+            raise ValueError(
+                f"Invalid left contact type: {self.config.device.left_contact_type}. "
+                "Please choose 'finite' or 'semi-infinite'."
+            )
+
+        if self.config.device.right_contact_type == "finite":
+            system_matrix_r = system_matrix[..., *self.inds_rr]
+
+            # Add a small imaginary part.
+            system_matrix_r += (
+                1j * self.config.electron.eta_contact * s_k[..., *self.inds_rr]
+            )
+
+            g_r = linalg.inv(system_matrix_r)
+
+        elif self.config.device.right_contact_type == "semi-infinite":
+            # Use the Sancho-Rubio method to compute the surface Green's
+            # function for the right contact.
+            block_size = self.inds_r.size
+            g_r = sancho_rubio(
+                system_matrix[..., *self.inds_rr]
+                + 1j * self.config.electron.eta_contact * s_k[..., *self.inds_rr],
+                (
+                    system_matrix[..., *self.inds_rc]
+                    + 1j * self.config.electron.eta_contact * s_k[..., *self.inds_rc]
+                )[..., :, :block_size],
+                (
+                    system_matrix[..., *self.inds_cr]
+                    + 1j * self.config.electron.eta_contact * s_k[..., *self.inds_cr]
+                )[..., :block_size, :],
+            )
+        else:
+            raise ValueError(
+                f"Invalid right contact type: {self.config.device.right_contact_type}. "
+                "Please choose 'finite' or 'semi-infinite'."
+            )
+
+        # Central region.
         sigma_l: NDArray = (
             system_matrix[..., *self.inds_cl] @ g_l @ system_matrix[..., *self.inds_lc]
         )
@@ -390,17 +432,32 @@ class TransportSolver:
         *__, phi = self.compute_potentials(bias_point)
         if comm.rank == 0:
             print(f"Computed effective electrostatic potential {phi:.2f} V", flush=True)
-        potential_drop = _linear_potential(
-            phi,
-            self.orbital_positions[self.inds_l][:, self.transport_axis].max(),
-            self.orbital_positions[self.inds_r][:, self.transport_axis].min(),
-        )
+
+        if self.config.device.potential_drop_region == "auto":
+            start = self.orbital_positions[self.inds_l][:, self.transport_axis].max()
+            stop = self.orbital_positions[self.inds_r][:, self.transport_axis].min()
+        else:
+            start, stop = self.config.device.potential_drop_region
+
+        potential_drop = _linear_potential(phi, start, stop)
+
         self.potential = xp.array(
             potential_drop(self.orbital_positions[:, self.transport_axis])
         )
-        # Hack to make the TMD potential zero at the right contact.
-        self.potential[self.inds_r] = 0.0
-        self.potential[self.inds_l] = phi
+
+        if self.config.device.potential_drop_region == "auto":
+            # Hack to make the TMD potential zero at the right contact.
+            self.potential[self.inds_l] = phi
+            self.potential[self.inds_r] = 0.0
+        else:
+            start_ind = np.argmin(
+                np.abs(self.orbital_positions[:, self.transport_axis] - start)
+            )
+            stop_ind = np.argmin(
+                np.abs(self.orbital_positions[:, self.transport_axis] - stop)
+            )
+            self.potential[:start_ind] = phi
+            self.potential[stop_ind:] = 0.0
 
     def solve(self):
         """Solves the transport equations for the given bias points."""
@@ -434,6 +491,16 @@ class TransportSolver:
                         f"k-point slice {kpt_slice.start}:{kpt_slice.stop}",
                         flush=True,
                     )
+                    if cpx is not None:
+                        # Show memory usage before the computation. also
+                        # as a percentage of the total memory.
+                        free_memory, total_memory = xp.cuda.Device().mem_info
+                        usage = np.array((total_memory - free_memory) / total_memory)
+                        print(
+                            f"{usage * 100:.2f}% GPU memory used before computation.",
+                            flush=True,
+                        )
+
                 for energy_slice in energy_slices:
                     # Compute the transmission for the given energy and k-point
                     self._compute_transmission(
@@ -465,7 +532,7 @@ class TransportSolver:
             # Use the capacitor model to compute the chemical potentials.
             mu_l, mu_r, phi = self.compute_potentials(bias_point)
             mu_l = mu_l + self.fermi_level - phi
-            mu_r = mu_r + self.fermi_level # r is top and grounded.
+            mu_r = mu_r + self.fermi_level  # r is top and grounded.
 
             self.mu_ls[i] = mu_l
             self.mu_rs[i] = mu_r
