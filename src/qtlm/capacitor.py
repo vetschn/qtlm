@@ -1,8 +1,10 @@
-import numpy as np
-from qtlm.constants import e, hbar
-from scipy import optimize
-from typing import Callable, Literal
 from functools import partial
+from typing import Callable, Literal
+
+import numpy as np
+from scipy import optimize
+
+from qtlm.constants import e, hbar
 
 
 def _compute_plate_charge_density(

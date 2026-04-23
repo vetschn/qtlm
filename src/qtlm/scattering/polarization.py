@@ -5,12 +5,9 @@ import scipy
 import scipy.sparse as sp
 
 from qtlm import NDArray, xp
-from qtlm.scattering.device import Device
-
-from qtlm.constants import hbar, mu_0
-
-from qtlm.scattering.device import Device
 from qtlm.config import QTLMConfig
+from qtlm.constants import hbar, mu_0
+from qtlm.scattering.device import Device
 
 device = Device()
 

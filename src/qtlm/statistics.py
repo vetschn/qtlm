@@ -1,5 +1,6 @@
-from qtlm import NDArray
 import numpy as np
+
+from qtlm import NDArray
 from qtlm.constants import k_B
 
 

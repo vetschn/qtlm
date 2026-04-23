@@ -2,10 +2,11 @@ from threadpoolctl import threadpool_limits  # isort:skip
 from pathlib import Path
 
 from qtlm.config import parse_config
-from qtlm.scattering.scba import SCBA
 from qtlm.scattering.device import Device
+from qtlm.scattering.scba import SCBA
 
 device = Device()
+
 
 def main(config_file: Path):
     """Calculates transport through the structure.

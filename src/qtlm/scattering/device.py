@@ -1,10 +1,11 @@
-from qtlm.io import read_tight_binding_data
-from qtlm import NDArray, xp
-from ase.dft import kpoints
 import numpy as np
-
 import scipy.sparse as sp
-from qtlm.constants import hbar, c_0
+from ase.dft import kpoints
+
+from qtlm import NDArray, xp
+from qtlm.constants import c_0, hbar
+from qtlm.io import read_tight_binding_data
+
 
 def linear_potential(v_at_pos_min: float, pos_min: float, pos_max: float) -> callable:
     """Creates a linear potential drop between two planes.
@@ -159,8 +160,7 @@ class Device:
             self.inds_rc = np.ix_(self.inds_r, self.inds_c)
             self.inds_cc = np.ix_(self.inds_c, self.inds_c)
 
-
-    def compute_d0(self,photon_energies):
+    def compute_d0(self, photon_energies):
         """
         3D tensor D0[m, i, j] of Initial Photon Green's functions between each pair (n,m) of positions
         R_positions : (N,3) array of positions of orbitals
@@ -172,7 +172,7 @@ class Device:
         r = xp.linalg.norm(self.distances, axis=2)  # (N, N)
         r_norm = r.copy()
         xp.fill_diagonal(r_norm, xp.inf)
-        
+
         D0 = xp.exp(1j * k[:, None, None] * r_norm[None, :, :]) / (
             4 * xp.pi * r_norm[None, :, :]
         )
@@ -183,10 +183,10 @@ class Device:
         return D0  # shape (Nw,N,N)
 
     def compute_d0_delta_perp(self, photon_energies):
-        
+
         D0 = self.compute_d0(self, photon_energies)
-        sigma=1e-10, 
-        tol=0.0
+        sigma = (1e-10,)
+        tol = 0.0
         N = self.distances.shape[0]
         pref = 1.0 / (4.0 * xp.pi)
 
@@ -225,8 +225,7 @@ class Device:
                     ).tocsr()
                 else:
                     delta_transverse[(i, j)] = sp.csr_matrix(delta_transversal)
-            
-            
+
         num_orbital = self.distances.shape[0]
 
         # stack into dense tensor Delta[i,j,u,v]
@@ -236,11 +235,10 @@ class Device:
         for u in range(3):
             for v in range(3):
                 D_t = delta_transverse[(u, v)]
-                Delta[:, :, u, v] = D_t.toarray() if sp.issparse(D_t) else xp.asarray(D_t)
+                Delta[:, :, u, v] = (
+                    D_t.toarray() if sp.issparse(D_t) else xp.asarray(D_t)
+                )
 
         out = oe.contract("wij,jkuv->wikuv", D0, Delta)
 
         return out  # (Nw, N, N, 3, 3)
-
-
-

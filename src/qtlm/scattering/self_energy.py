@@ -3,13 +3,9 @@ import time
 import opt_einsum as oe
 import scipy
 
-
 from qtlm import NDArray, xp
-from qtlm.scattering.device import Device
-
-from qtlm.constants import mu_0
 from qtlm.config import QTLMConfig
-
+from qtlm.constants import mu_0
 from qtlm.scattering.device import Device
 
 device = Device()
@@ -54,10 +50,14 @@ class SelfEnergy:
 
         # compute self-energy
 
-        if not xp.allclose(xp.diff(self.electron_energies), self.dE, rtol=1e-6, atol=1e-12):
+        if not xp.allclose(
+            xp.diff(self.electron_energies), self.dE, rtol=1e-6, atol=1e-12
+        ):
             raise ValueError("energy_grid should be uniformly spaced for FFT")
 
-        if not xp.allclose(xp.diff(self.electron_energies), self.dhw, rtol=1e-6, atol=1e-12):
+        if not xp.allclose(
+            xp.diff(self.electron_energies), self.dhw, rtol=1e-6, atol=1e-12
+        ):
             raise ValueError("photon_energy should be uniformly spaced for FFT")
 
         if not xp.isclose(self.dhw, self.dE):
@@ -134,7 +134,9 @@ class SelfEnergy:
         )  # in np : 0.583s | scipy : 0.149s
 
         # index array
-        idx = xp.round((self.electron_energies - self.electron_energies[0]) / self.dhw).astype(int)
+        idx = xp.round(
+            (self.electron_energies - self.electron_energies[0]) / self.dhw
+        ).astype(int)
 
         if xp.any((idx < 0) | (idx >= Sigma_full.shape[0])):
 

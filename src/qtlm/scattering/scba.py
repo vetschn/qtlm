@@ -1,12 +1,11 @@
-from qtlm import NDArray, xp
+from dataclasses import dataclass
 
+from qtlm import NDArray, xp
+from qtlm.scattering.device import Device
 from qtlm.scattering.electron import ElectronSolver
 from qtlm.scattering.photon import PhotonSolver
 from qtlm.scattering.polarization import Polarization
 from qtlm.scattering.self_energy import SelfEnergy
-from dataclasses import dataclass
-
-from qtlm.scattering.device import Device
 
 device = Device()
 
@@ -52,7 +51,6 @@ class SCBA:
                 self.data.sigma_greater,
             )
             print("Electron Green's functions computed.")
-
 
             self.data.pi_lesser, self.data.pi_greater = self.polarization.compute(
                 self.data.g_lesser,
